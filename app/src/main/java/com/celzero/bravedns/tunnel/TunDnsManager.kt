@@ -12,6 +12,10 @@ import com.celzero.bravedns.service.DomainRulesManager
 import com.celzero.bravedns.service.FirewallManager
 import com.celzero.bravedns.service.FirewallRuleset
 import com.celzero.bravedns.service.IpRulesManager
+import com.celzero.bravedns.service.LogActivityAggregator
+import com.celzero.bravedns.service.LogActivityEvent
+import com.celzero.bravedns.service.LogActivitySource
+import com.celzero.bravedns.service.DnsLogTracker
 import com.celzero.bravedns.service.NetLogTracker
 import com.celzero.bravedns.service.PersistentState
 import com.celzero.bravedns.service.ProxyManager
@@ -19,6 +23,7 @@ import com.celzero.bravedns.service.ProxyManager.ID_WG_BASE
 import com.celzero.bravedns.service.ProxyManager.isAnyUserSetProxy
 import com.celzero.bravedns.service.TailscaleManager
 import com.celzero.bravedns.service.TunFirewallManager
+import com.celzero.bravedns.service.TunFlowManager
 import com.celzero.bravedns.service.VpnController
 import com.celzero.bravedns.service.WireguardManager
 import com.celzero.bravedns.ui.bottomsheet.BlockFreeDnsModeBottomSheet
@@ -34,13 +39,16 @@ import com.celzero.firestack.backend.Backend
 import com.celzero.firestack.backend.DNSOpts
 import com.celzero.firestack.backend.DNSSummary
 import com.celzero.firestack.intra.Mark
+import com.google.common.cache.Cache
+import com.google.common.cache.CacheBuilder
 import kotlinx.coroutines.CoroutineScope
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
+import java.time.Duration
 
 object TunDnsManager: KoinComponent {
     private const val TAG = "TunDnsManager"
-    data class DnsParams(val origin: String, val uidStr: String?, val fqdn: String, val qtype: Long, val isLockdown: Boolean, val ssid: String?, val isIfaceCellular: Boolean)
+    data class DnsParams(val origin: String, val uidStr: String?, val fqdn: String, val qtype: Long, val isLockdown: Boolean, val ssid: String?, val isIfaceCellular: Boolean, val isCaptivePortal: Boolean = false)
 
     data class UpstreamAnswerParams(
         val scope: CoroutineScope,
@@ -58,13 +66,15 @@ object TunDnsManager: KoinComponent {
         val isConnectionMetered: (String) -> Boolean,
         val determineProxyDetails: suspend (ConnTrackerMetaData, Boolean, Boolean) -> Mark,
         val onDeviceLocked: (() -> Unit)?,
-        val onAccessibilityFailure: (() -> Unit)?
+        val onAccessibilityFailure: (() -> Unit)?,
+        val isCaptivePortal: Boolean
     )
 
     private val persistentState by inject<PersistentState>()
     private val appConfig by inject<AppConfig>()
     private val netLogTracker by inject<NetLogTracker>()
     private val tsManager: TailscaleManager by inject()
+    private val activityAggregator by inject<LogActivityAggregator>()
 
     private val rethinkUid = android.os.Process.myUid()
 
@@ -72,6 +82,15 @@ object TunDnsManager: KoinComponent {
     // only when this flag is true, ensuring unknown app DNS requests are blocked and avoiding
     // issues when Android omits uid in dns requests
     private var isUidPresentInAnyDnsRequest: Boolean = false
+
+    // used to store the dns-filter decision (firewall rule id) taken during the
+    // upstream-answer evaluation, keyed by the dns query's flow id (fid). consumed when
+    // the dns log row is persisted (onResponse -> processDnsLog) so the dns log ui can
+    // show the exact block/allow reason; unconsumed entries expire on their own
+    private val trackedDnsFilterReasons: Cache<String, String> =
+        CacheBuilder.newBuilder()
+            .expireAfterWrite(Duration.ofSeconds(300))
+            .build()
 
     // gomobile's DNSOpts() constructor invokes native seq code which cannot run under JVM
     // (Robolectric) tests; the constructor itself NPEs and cannot be intercepted by a shadow or
@@ -136,6 +155,18 @@ object TunDnsManager: KoinComponent {
         val uid = getUid(uidStr)
         val rinr = persistentState.routeRethinkInRethink
         val appMode = appConfig.getBraveMode()
+
+        // when the active network is behind a captive portal, route every query to the system
+        // dns and bypass local blocklists so the portal's sign-in flow can resolve; the mode
+        // ends once the network is validated (captive-portal capability cleared), at which
+        // point queries resume on the user-configured transport. firewall and qtype rules
+        // continue to apply (see checkUserAllowedDnsQtypes below)
+        if (d.isCaptivePortal) {
+            logw("onQuery: captive portal active, routing ${d.fqdn} to system dns")
+            val r = makeNsOpts(uid, Pair(Backend.System, ""), d.fqdn, true, d.isIfaceCellular, d.ssid)
+            return checkUserAllowedDnsQtypes(r, uid, d.fqdn, d.qtype, d.isIfaceCellular, d.ssid)
+        }
+
         logd("onQuery: appConfig.getBraveMode for ${d.fqdn}")
         if (appMode.isDnsMode()) {
             result = getTransportIdForDnsMode(uid, d.fqdn, rinr, d.isLockdown, d.isIfaceCellular, d.ssid)
@@ -248,6 +279,18 @@ object TunDnsManager: KoinComponent {
             return opts
         }
 
+        // skip applying rules for system components (DNS and ANDROID) on Android 11 and below,
+        // as we cannot determine the actual app from which the request originated when split dns
+        // is disabled. However, when split dns is enabled, advanced dns filtering will also be
+        // enabled on Android 11 and below, allowing Rethink to determine the actual requesting app.
+        // In that case, we can apply the app-specific rules.
+        val isProtectedUid = uid == AndroidUidConfig.ANDROID.uid || uid == AndroidUidConfig.DNS.uid || uid == rethinkUid
+        if (isAtleastR() && isProtectedUid && !persistentState.splitDns) {
+            val opts = makeNsOpts(uid, tid, fqdn, false, isIfaceCellular, ssid)
+            logd("onQuery: makeNsOpts(protected-uid) for $fqdn")
+            return opts
+        }
+
         if (uid == INVALID_UID) {
             val anyAppBypass = FirewallManager.isAnyAppBypassesDns()
             logd("onQuery: FirewallManager.isAnyAppBypassesDns for $fqdn")
@@ -322,8 +365,8 @@ object TunDnsManager: KoinComponent {
                 DomainRulesManager.Status.NONE -> {}
             }
 
-            // disable global rules check, see #onUpstreamAnswer() for more details.
-            val skipGlobalRules = true
+            // global trusted domains need to send noBlock as true
+            val skipGlobalRules = false
             if (!skipGlobalRules) {
                 val globalDomainRule = DomainRulesManager.getAggregatedDomainRule(fqdn, UID_EVERYBODY).first
                 logd("onQuery: getDomainRule($fqdn, UID_EVERYBODY) for $fqdn")
@@ -334,11 +377,7 @@ object TunDnsManager: KoinComponent {
                         return opts
                     }
 
-                    DomainRulesManager.Status.BLOCK -> {
-                        val opts = makeNsOpts(uid, Pair(Backend.BlockAll, ""), fqdn, false, isIfaceCellular, ssid)
-                        logd("onQuery: makeNsOpts(global-blocked-df) for $fqdn")
-                        return opts
-                    }
+                    DomainRulesManager.Status.BLOCK -> {} // taken care in onUpstreamAnswer
 
                     DomainRulesManager.Status.NONE -> {}
                 }
@@ -440,7 +479,8 @@ object TunDnsManager: KoinComponent {
             val usesCellularNw = isIfaceCellular
             val ssid = ssid ?: ""
             val rpnIds = if (RpnProxyManager.isRpnActive()) RpnProxyManager.getAllPossibleConfigIdsForApp(uid, ip = "", port = 0, domain, usesCellularNw, ssid) else emptyList()
-            val wgIds = WireguardManager.getAllPossibleConfigIdsForApp(uid, ip = "", port = 0, domain, usesCellularNw, ssid, defaultTid)
+            val defTid = if (rpnIds.isNotEmpty()) "" else defaultTid
+            val wgIds = WireguardManager.getAllPossibleConfigIdsForApp(uid, ip = "", port = 0, domain, usesCellularNw, ssid, defTid)
             val tsId = run {
                 if (tsManager.isEnabled() && tsManager.isEngineUp && tsManager.currentState().isUsable &&
                     ProxyManager.getProxyIdForApp(uid).contains(TailscaleManager.ID_TS_BASE)) {
@@ -783,8 +823,63 @@ object TunDnsManager: KoinComponent {
                 return
             }
         }
+        aggregateDnsActivity(summary)
         netLogTracker.processDnsLog(summary)
         onRegionUpdate(summary.region)
+    }
+
+    /**
+     * Arrival-time activity aggregation, owned at this caller level; the
+     * trackers stay persistence-only. Kept behind the same gates as
+     * processDnsLog so the in-memory grid and the dns-log table stay in sync.
+     */
+    private fun aggregateDnsActivity(summary: DNSSummary) {
+        if (!persistentState.logsEnabled) return
+
+        activityAggregator.recordOnArrival(
+            LogActivityEvent(
+                summary.start,
+                LogActivitySource.DNS,
+                DnsLogTracker.isBlockedDnsAnswer(
+                    transportId = summary.id,
+                    statusCode = summary.status,
+                    response = summary.rData ?: "",
+                    qType = summary.qType,
+                    blocklists = summary.blocklists ?: "",
+                    upstreamBlock = summary.upstreamBlocks
+                )
+            )
+        )
+    }
+
+    /**
+     * Records the firewall rule that decided the fate of a dns query during the
+     * upstream-answer evaluation. The put overwrites any prior entry for the same
+     * fid, so a decision can never be duplicated for one dns query.
+     */
+    fun trackDnsFilterReason(fid: String, ruleId: String) {
+        if (fid.isEmpty() || ruleId.isEmpty()) return
+
+        trackedDnsFilterReasons.put(fid, ruleId)
+        Logger.vv(LOG_TAG_VPN, "$TAG trackedDnsFilterReasons: fid: $fid, rule: $ruleId, cache-size: ${trackedDnsFilterReasons.size()}")
+    }
+
+    /**
+     * Consumes (returns and removes) the recorded decision for the given fid so the
+     * same reason is never applied to more than one dns log entry.
+     */
+    fun consumeDnsFilterReason(fid: String): String {
+        if (fid.isEmpty()) return ""
+
+        val reason = trackedDnsFilterReasons.getIfPresent(fid) ?: return ""
+        trackedDnsFilterReasons.invalidate(fid)
+        return reason
+    }
+
+    // drops all recorded decisions; called on vpn teardown so the next session
+    // does not inherit stale fid -> rule entries
+    fun clearTrackedDnsFilterReasons() {
+        trackedDnsFilterReasons.invalidateAll()
     }
 
     suspend fun handleOnUpstreamAnswer(params: UpstreamAnswerParams): DNSOpts {
@@ -809,6 +904,13 @@ object TunDnsManager: KoinComponent {
             return dnsOptsFactory()
         }
 
+        // keep the previous DNS options for captive portals, using Dnsx.System and noBlock is
+        // set to true
+        if (params.isCaptivePortal) {
+            Logger.i(LOG_TAG_VPN, "onUpstreamAnswer: captive portal, returning prev DNSOpts()")
+            return dnsOptsFactory()
+        }
+
         val isAnyPortRule = IpRulesManager.isPortRuleSetForIp(params.ipcsv, uid) ||
             IpRulesManager.isPortRuleSetForIp(params.ipcsv, UID_EVERYBODY)
         if (isAnyPortRule) {
@@ -820,7 +922,7 @@ object TunDnsManager: KoinComponent {
             "onUpstreamAnswer: init, ${params.id}, sum: ${params.smm}, ipcsv: ${params.ipcsv}, opts: ${params.rcvdDnsOpts}"
         )
         if (params.ipcsv.isEmpty()) {
-            Logger.e(LOG_TAG_VPN, "onUpstreamAnswer: empty ipcsv, returning prev DNSOpts()")
+            Logger.w(LOG_TAG_VPN, "onUpstreamAnswer: empty ipcsv, returning prev DNSOpts()")
             return dnsOptsFactory()
         }
         if (appConfig.getBraveMode().isDnsMode()) {
@@ -913,6 +1015,7 @@ object TunDnsManager: KoinComponent {
         val rule = TunFirewallManager.firewall(firewallParams)
         val blocked = FirewallRuleset.ground(rule)
         if (blocked) {
+            trackDnsFilterReason(params.smm.fid, rule.id)
             logd("onUpstreamAnswer: blocked by firewall, rule: $rule, connInfo: $connInfo, ipcsv: ${params.ipcsv}")
             return dnsOptsFactory().apply {
                 tidcsv = Backend.BlockAll
@@ -924,14 +1027,16 @@ object TunDnsManager: KoinComponent {
         // the blockfree / default transport. Avoid sending the same transport id back,
         // instead send DNSOpts() object. Sending the same transport id again will make the tun
         // to start the resolve process again which is not needed
-        val isAppIsolated = FirewallManager.appStatus(uid).isIsolate()
+        val appFirewallStatus = FirewallManager.appStatus(uid)
+        val isAppIsolated = appFirewallStatus.isIsolate()
         val isDmnOrIpTrusted = rule == FirewallRuleset.RULE2F || rule == FirewallRuleset.RULE2B
         if (isAppIsolated && isDmnOrIpTrusted) {
             logd("onUpstreamAnswer: app is isolate and domain/ip is trusted, treat as allowed, rule: $rule, connInfo: $connInfo, ipcsv: ${params.ipcsv}")
             return dnsOptsFactory()
         }
-        val isBypass = FirewallRuleset.isBypassRule(rule)
+        val isBypass = FirewallRuleset.isDnsBypassRule(rule)
         if (isBypass) {
+            trackDnsFilterReason(params.smm.fid, rule.id)
             // use the same pid for non-blocking case, as the decision is already made in onQuery
             // and the same pid will be used in tunnel for the upstream query
             // For tid, based on the useFallbackDnsToBypass settings, the blockfree, default
@@ -941,7 +1046,12 @@ object TunDnsManager: KoinComponent {
                 val tidPair = getTransportIdToBypass(id, params.isLockdown)
                 if (tidPair == id) {
                     logd("onUpstreamAnswer: no bypass transport needed, rule: $rule")
-                    return dnsOptsFactory()
+                    val r = dnsOptsFactory().apply {
+                        tidcsv = tidPair.first
+                        tidseccsv = tidPair.second
+                        noblock = true
+                    }
+                    return r
                 }
                 val tid = tidPair.first.split(",").joinToString(",") { appendDnsCacheIfNeeded(it) }
                 val tidSec = if (tidPair.second.isEmpty()) "" else tidPair.second.split(",")

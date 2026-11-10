@@ -26,7 +26,6 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import by.kirich1409.viewbindingdelegate.viewBinding
 import com.celzero.bravedns.R
-import com.celzero.bravedns.adapter.WgIncludeAppsAdapter
 import com.celzero.bravedns.databinding.ActivityTailscaleSettingsBinding
 import com.celzero.bravedns.service.PersistentState
 import com.celzero.bravedns.service.TailscaleManager
@@ -42,8 +41,7 @@ import com.celzero.bravedns.util.handleFrostEffectIfNeeded
 import kotlinx.coroutines.launch
 import org.koin.android.ext.android.inject
 import org.koin.androidx.viewmodel.ext.android.viewModel
-import com.celzero.bravedns.ui.dialog.WgIncludeAppsDialog
-import com.celzero.bravedns.viewmodel.ProxyAppsMappingViewModel
+import com.celzero.bravedns.ui.activity.WgIncludeAppsActivity
 
 /**
  * Settings screen for the embedded Tailscale engine: enable/disable, login
@@ -54,7 +52,6 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
     private val b by viewBinding(ActivityTailscaleSettingsBinding::bind)
     private val persistentState by inject<PersistentState>()
     private val tsManager by inject<TailscaleManager>()
-    private val mappingViewModel: ProxyAppsMappingViewModel by viewModel()
 
     private fun Context.isDarkThemeOn(): Boolean {
         return resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
@@ -321,24 +318,14 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
             )
             return
         }
-        val proxyId = TailscaleManager.ID_TS_BASE
-        val appsAdapter = WgIncludeAppsAdapter(this, proxyId, TailscaleManager.TS_PROXY_NAME)
-        mappingViewModel.apps.removeObservers(this)
-        mappingViewModel.apps.observe(this) { appsAdapter.submitData(lifecycle, it) }
-        var themeId = Themes.getCurrentTheme(isDarkThemeOn(), persistentState.theme)
-        if (Themes.isFrostTheme(themeId)) {
-            themeId = R.style.App_Dialog_NoDim
-        }
-        val dialog =
-            WgIncludeAppsDialog(
+        // upstream replaced the per-app bottom dialog with a full-screen
+        // activity (app/src/main/.../ui/activity/WgIncludeAppsActivity.kt)
+        startActivity(
+            WgIncludeAppsActivity.newIntent(
                 this,
-                appsAdapter,
-                mappingViewModel,
-                themeId,
-                proxyId,
+                TailscaleManager.ID_TS_BASE,
                 TailscaleManager.TS_PROXY_NAME
             )
-        dialog.setCanceledOnTouchOutside(false)
-        dialog.show()
+        )
     }
 }

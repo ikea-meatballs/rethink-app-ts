@@ -14,8 +14,8 @@ runs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        # keep in sync with tailscale/go.mod and firestack's go.mod (go 1.26)
-        go-version: "1.26.x"
+        # keep in sync with tailscale/go.mod (firestack d3d530ea3e requires go 1.27)
+        go-version: "1.27.x"
         cache-dependency-path: tailscale/go.sum
 
     - name: Install gomobile + NDK
@@ -38,9 +38,12 @@ runs:
         set -euo pipefail
         cd tailscale
         # pin the exact firestack revision rethink currently consumes
-        # (com.celzero:firestack:61894b7fdb on Maven Central / Jitpack);
-        # resolves go.mod/go.sum if the pinned pseudo-version has drifted
-        go get github.com/celzero/firestack@61894b7fdb || true
+        # (com.celzero:firestack:d3d530ea3e on Maven Central);
+        # resolves go.mod/go.sum if the pinned pseudo-version has drifted.
+        # GOTOOLCHAIN=local so the runtime overlay patches this Go's GOROOT
+        # (firestack's Makefile); a downloaded toolchain stores src outside GOROOT.
+        export GOTOOLCHAIN=local
+        go get github.com/celzero/firestack@d3d530ea3e67 || true
         go mod download
         go mod tidy
 
@@ -63,6 +66,7 @@ runs:
         #   LDFLAGS='-checklinkname=0 -w -s -buildid=' (+ Date/Commit -X omitted)
         #   CGO_LDFLAGS='-s -w -Wl,-z,max-page-size=16384'
         export CGO_LDFLAGS='-Wl,-z,max-page-size=16384'
+        export GOTOOLCHAIN=local
         gomobile bind -trimpath -a \
           -javapkg=com.celzero.firestack \
           -androidapi 23 -target=android -tags='android,ts_omit_taildrop' \

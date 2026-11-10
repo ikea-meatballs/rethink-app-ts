@@ -18,6 +18,7 @@ import com.celzero.bravedns.service.BraveVPNService
 import com.celzero.bravedns.service.EventLogger
 import com.celzero.bravedns.service.PersistentState
 import com.celzero.bravedns.service.RethinkBlocklistManager
+import com.celzero.firestack.backend.Backend
 import com.celzero.firestack.backend.DNSResolver
 import com.celzero.firestack.backend.DNSTransport
 import com.celzero.firestack.backend.Proxies
@@ -233,23 +234,22 @@ class GoVpnAdapterTest : KoinTest {
     }
 
     @Test
-    fun `getDnsStatus returns rpn status for rpn-win id`() = runTest {
+    fun `getDnsStatus returns null for rpn-win id since it is not a resolver transport`() = runTest {
+        // getDnsStatus serves DNS transport status only; WIN proxy status is exposed
+        // via the RPN API surface (e.g. hasRpnWin / rpn().win()), not the resolver
         val tunnel = mockk<Tunnel>(relaxed = true)
         every { tunnel.isConnected } returns true
 
-        val proxies = mockk<Proxies>(relaxed = true)
-        val rpn = mockk<com.celzero.firestack.backend.Rpn>(relaxed = true)
-        val win = mockk<com.celzero.firestack.backend.RpnProxy>(relaxed = true)
-        every { tunnel.proxies } returns proxies
-        every { proxies.rpn() } returns rpn
-        every { rpn.win() } returns win
-        every { win.status() } returns 11
+        val resolver = mockk<DNSResolver>(relaxed = true)
+        every { tunnel.resolver } returns resolver
+        // no transport registered for the rpn-win id
+        every { resolver.get(com.celzero.firestack.backend.Backend.RpnWin) } returns null
 
         val adapter = newAdapter(tunnel)
 
         val status = adapter.getDnsStatus(com.celzero.firestack.backend.Backend.RpnWin)
 
-        assertEquals(11, status)
+        assertNull(status)
     }
 
     @Test
@@ -428,6 +428,31 @@ class GoVpnAdapterTest : KoinTest {
         }
 
         assertTrue(threw)
+    }
+
+    @Test
+    fun `healthy endpoint with the same url is left alone`() {
+        val url = "socks5://user:pass@127.0.0.1:1055"
+        assertFalse(GoVpnAdapter.shouldReaddEndpoint(Backend.TUP, url, url))
+        assertFalse(GoVpnAdapter.shouldReaddEndpoint(Backend.TZZ, "127.0.0.1:1055", url))
+        assertFalse(
+            GoVpnAdapter.shouldReaddEndpoint(Backend.TUP, "127.0.0.1:1053", "127.0.0.1:1053")
+        )
+    }
+
+    @Test
+    fun `endpoint is readded when missing unhealthy or url changed`() {
+        val url = "socks5://user:pass@127.0.0.1:1055"
+        val rotated = "socks5://other:secret@127.0.0.1:1055"
+        assertTrue(GoVpnAdapter.shouldReaddEndpoint(null, url, url))
+        assertTrue(GoVpnAdapter.shouldReaddEndpoint(Backend.TNT, url, url))
+        assertTrue(GoVpnAdapter.shouldReaddEndpoint(Backend.TUP, null, url))
+        assertTrue(GoVpnAdapter.shouldReaddEndpoint(Backend.TUP, "", url))
+        // a remembered socks5 url with a new secret must be registered again
+        assertFalse(GoVpnAdapter.endpointAddrsEqual(url, rotated))
+        assertTrue(GoVpnAdapter.shouldReaddEndpoint(Backend.TUP, url, rotated))
+        assertTrue(GoVpnAdapter.shouldReaddEndpoint(Backend.TUP, url, "socks5://user:pass@10.0.0.2:1055"))
+        assertTrue(GoVpnAdapter.shouldReaddEndpoint(Backend.TUP, "127.0.0.1:1053", "127.0.0.1:1054"))
     }
 }
 

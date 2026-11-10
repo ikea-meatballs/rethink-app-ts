@@ -42,7 +42,7 @@ single `libgojni.so`. gomobile hardcodes `libgojni.so` and `go.Seq`, so two
 separate AARs cannot coexist in one process — and an AAR bound from this
 directory alone lacks the `intra.*` bindings the app compiles against.
 
-Requirements: Go >= 1.26, Android SDK + NDK (CI pins `28.2.13676358`), JDK 17.
+Requirements: Go >= 1.27 (firestack `d3d530ea3e`), Android SDK + NDK (CI pins `28.2.13676358`), JDK 17.
 The authoritative, CI-identical recipe is
 `.github/actions/build-tailscale-aar/action.yml`; the short local version:
 
@@ -62,6 +62,8 @@ printf '{"Replace":{"src/runtime/write_err_android.go":"%s"}}' \
   "$PWD/build/src/runtime/write_err_android.go" > build/overlay.json
 
 export CGO_LDFLAGS='-Wl,-z,max-page-size=16384'
+# local toolchain so the runtime overlay patches this Go's GOROOT
+export GOTOOLCHAIN=local
 gomobile bind -trimpath -a \
   -javapkg=com.celzero.firestack \
   -androidapi 23 -target=android -tags='android,ts_omit_taildrop' \

@@ -94,7 +94,7 @@ Key decisions:
 | --- | --- |
 | `tailscale/engine.go` | gomobile-bound engine (userspace tailscaled + SOCKS5 + DNS relay) |
 | `tailscale/engine_test.go` | Go unit tests (log-id persistence) |
-| `tailscale/go.mod`, `tailscale/go.sum` | pins `tailscale.com v1.102.3` and `firestack@61894b7fdb`; declares gomobile/gobind as module tools |
+| `tailscale/go.mod`, `tailscale/go.sum` | pins `tailscale.com v1.102.3` and `firestack@d3d530ea3e`; declares gomobile/gobind as module tools |
 | `tailscale/tools/runtime_write_err_android.patch` | vendored firestack runtime-overlay patch applied during the bind |
 | `.github/workflows/tailscale-aar.yml` | builds/publishes `tailscale.aar` releases (`ts-aar-v*` tags) |
 | `.github/actions/build-tailscale-aar/` | composite action used by all APK workflows |
@@ -130,6 +130,8 @@ printf '{"Replace":{"src/runtime/write_err_android.go":"%s"}}' \
   "$PWD/build/src/runtime/write_err_android.go" > build/overlay.json
 
 export CGO_LDFLAGS='-Wl,-z,max-page-size=16384'
+# local toolchain so the runtime overlay patches this Go's GOROOT
+export GOTOOLCHAIN=local
 gomobile bind -trimpath -a \
   -javapkg=com.celzero.firestack \
   -androidapi 23 -target=android -tags='android,ts_omit_taildrop' \
