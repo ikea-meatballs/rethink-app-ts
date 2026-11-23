@@ -55,6 +55,7 @@ import (
 	"tailscale.com/tsd"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
+	"tailscale.com/types/nettype"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/netstack"
 )
@@ -68,6 +69,14 @@ const (
 	StateStopped          = int(ipn.Stopped)
 	StateStarting         = int(ipn.Starting)
 	StateRunning          = int(ipn.Running)
+)
+
+// inboundFluxTCPPortMin/Max bound the hardcoded inbound TCP allowlist for
+// Flux: only these destination ports, on this node's Tailscale IP, are
+// forwarded by netstack to 127.0.0.1:<port>. Everything else is rejected.
+const (
+	inboundFluxTCPPortMin uint16 = 12070
+	inboundFluxTCPPortMax uint16 = 12108
 )
 
 // Socks5Addr is the loopback endpoint serving SOCKS5.
@@ -126,6 +135,38 @@ type Engine struct {
 	// reach the tailnet, bypassing Rethink's per-app assignment.
 	socksUser string
 	socksPass string
+}
+
+// inboundHardDenyTCPPorts are destination ports this engine itself listens on
+// (its local DNS relay and SOCKS5). They are denied even if they ever landed
+// inside the Flux range.
+var inboundHardDenyTCPPorts = []uint16{
+	netip.MustParseAddrPort(DNSAddr).Port(),
+	netip.MustParseAddrPort(Socks5Addr).Port(),
+}
+
+// inboundTCPHandler decides whether an inbound TCP flow to this node's
+// Tailscale IP should be forwarded to 127.0.0.1 or rejected.
+//
+// Returns (nil, false) to let netstack forward to 127.0.0.1:<dst.Port()>.
+// Returns (nil, true) to make netstack reject (RST) and never forward.
+func inboundTCPHandler(src, dst netip.AddrPort) (func(net.Conn), bool) {
+	port := dst.Port()
+	for _, deny := range inboundHardDenyTCPPorts {
+		if port == deny {
+			return nil, true
+		}
+	}
+	if port >= inboundFluxTCPPortMin && port <= inboundFluxTCPPortMax {
+		return nil, false // default forwarding to 127.0.0.1:<port>
+	}
+	return nil, true
+}
+
+// inboundUDPHandler always rejects inbound UDP so netstack never forwards it
+// to 127.0.0.1 (protecting the DNS relay on UDP 1053). Flux is TCP-only.
+func inboundUDPHandler(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
+	return nil, true
 }
 
 // NewEngine constructs an Engine. stateDir persists node identity across app
@@ -221,12 +262,24 @@ func NewEngine(stateDir string, cb Callback) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("netstack: %w", err)
 	}
-	// SECURITY: must stay false. When true, netstack rewrites inbound tailnet
-	// TCP/UDP aimed at this node's own Tailscale IP to 127.0.0.1:<port>,
-	// exposing every loopback listener on the device (this engine's SOCKS5
-	// and DNS relay, plus other apps' local servers) to any tailnet peer the
-	// ACL lets reach this node. This node only originates connections.
-	ns.ProcessLocalIPs = false
+	// SECURITY: inbound tailnet flows aimed at this node's own Tailscale IP
+	// are default-deny (same posture tsnet relies on). ProcessLocalIPs is
+	// true so that allowlisted inbound TCP can be rewritten by netstack to
+	// 127.0.0.1:<port>; GetTCPHandlerForFlow then default-denies every
+	// destination port except the hardcoded Flux range [12070, 12108], and
+	// hard-denies 1053 (this engine's DNS relay) and 1055 (this engine's
+	// SOCKS5) even if they were ever inside that range. Denied flows are
+	// RST by netstack and never reach loopback, so no other loopback
+	// listener (this engine's SOCKS5/DNS, or another app's local server) is
+	// exposed to the tailnet. A nil GetTCPHandlerForFlow would forward
+	// everything, which is why it must always be installed.
+	ns.ProcessLocalIPs = true
+	// GetUDPHandlerForFlow rejects every inbound UDP unconditionally: with
+	// ProcessLocalIPs true and no handler installed, netstack would forward
+	// all inbound UDP to 127.0.0.1, exposing the DNS relay on UDP 1053 to
+	// any tailnet peer. Flux only needs TCP.
+	ns.GetTCPHandlerForFlow = inboundTCPHandler
+	ns.GetUDPHandlerForFlow = inboundUDPHandler
 	// ...but replies to connections this node originated (and nothing else)
 	// must still reach netstack: admit only packets matching an existing
 	// gVisor endpoint. Without this, every outbound tailnet dial times out
