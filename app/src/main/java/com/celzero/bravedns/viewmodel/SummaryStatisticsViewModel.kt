@@ -15,20 +15,26 @@
  */
 package com.celzero.bravedns.viewmodel
 
+import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.liveData
 import androidx.lifecycle.switchMap
 import androidx.lifecycle.viewModelScope
 import androidx.paging.Pager
 import androidx.paging.PagingConfig
 import androidx.paging.cachedIn
 import androidx.paging.liveData
+import com.celzero.bravedns.data.AppConnection
+import com.celzero.bravedns.data.BlocklistStatsAggregator
 import com.celzero.bravedns.data.DataUsageSummary
 import com.celzero.bravedns.database.ConnectionTracker
 import com.celzero.bravedns.database.ConnectionTrackerDAO
 import com.celzero.bravedns.database.StatsSummaryDao
 import com.celzero.bravedns.service.VpnController
 import com.celzero.bravedns.util.Constants
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 class SummaryStatisticsViewModel(
     private val connectionTrackerDAO: ConnectionTrackerDAO,
@@ -40,15 +46,10 @@ class SummaryStatisticsViewModel(
     private val countryActivities: MutableLiveData<String> = MutableLiveData()
     private val domains: MutableLiveData<String> = MutableLiveData()
     private val ips: MutableLiveData<String> = MutableLiveData()
+    private val blocklists: MutableLiveData<Long> = MutableLiveData()
     private var timeCategory: TimeCategory = TimeCategory.ONE_HOUR
     private val startTime: MutableLiveData<Long> = MutableLiveData()
     private var loadMoreClicked: Boolean = false
-
-    companion object {
-        private const val ONE_HOUR_MILLIS = 1 * 60 * 60 * 1000L
-        private const val ONE_DAY_MILLIS = 24 * ONE_HOUR_MILLIS
-        private const val ONE_WEEK_MILLIS = 7 * ONE_DAY_MILLIS
-    }
 
     enum class TimeCategory(val value: Int) {
         ONE_HOUR(0),
@@ -66,11 +67,14 @@ class SummaryStatisticsViewModel(
         topActiveConns.value = VpnController.uptimeMs()
         networkActivity.value = ""
         asn.value = ""
+        blocklists.value = startTime.value
     }
 
     fun getTimeCategory(): TimeCategory {
         return timeCategory
     }
+
+    fun getStartTime(): Long = checkNotNull(startTime.value)
 
     fun setLoadMoreClicked(b: Boolean) {
         loadMoreClicked = b
@@ -95,6 +99,7 @@ class SummaryStatisticsViewModel(
         }
         networkActivity.value = ""
         asn.value = ""
+        blocklists.value = startTime.value
         if (loadMoreClicked) {
             countryActivities.value = ""
             ips.value = ""
@@ -200,8 +205,37 @@ class SummaryStatisticsViewModel(
                 .cachedIn(viewModelScope)
         }
 
+    /**
+     * Per-blocklist blocked totals for the current time window. The CSV token
+     * split happens in [BlocklistStatsAggregator], so this section is a static
+     * list instead of a Room-paged flow; it recomputes whenever the time
+     * category changes (the [blocklists] trigger carries the window start).
+     */
+    val mostBlockedBlocklists: LiveData<List<AppConnection>> =
+        blocklists.switchMap { to ->
+            liveData {
+                emit(fetchBlockedBlocklists(to))
+            }
+        }
+
+    private suspend fun fetchBlockedBlocklists(to: Long): List<AppConnection> {
+        return withContext(Dispatchers.IO) {
+            // DnsLogs is the single source of truth for DNS-level blocks;
+            // ConnectionTracker rows echo the same block and would double-count
+            BlocklistStatsAggregator.toAppConnections(
+                BlocklistStatsAggregator.aggregate(statsDao.getBlockedBlocklistCombos(to))
+            )
+        }
+    }
+
     suspend fun totalUsage(): DataUsageSummary {
         val to = startTime.value ?: 0L
         return connectionTrackerDAO.getTotalUsages(to, ConnectionTracker.ConnType.METERED.value)
+    }
+
+    companion object {
+        private const val ONE_HOUR_MILLIS = 1 * 60 * 60 * 1000L
+        private const val ONE_DAY_MILLIS = 24 * ONE_HOUR_MILLIS
+        private const val ONE_WEEK_MILLIS = 7 * ONE_DAY_MILLIS
     }
 }

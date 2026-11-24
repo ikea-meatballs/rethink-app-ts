@@ -23,6 +23,7 @@ import android.text.method.LinkMovementMethod
 import android.view.View
 import android.view.animation.AnticipateOvershootInterpolator
 import android.widget.Toast
+import androidx.core.view.doOnNextLayout
 import androidx.core.view.isVisible
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
@@ -36,11 +37,18 @@ import com.celzero.bravedns.R
 import com.celzero.bravedns.adapter.GooglePlaySubsAdapter
 import com.celzero.bravedns.databinding.FragmentRethinkPlusPremiumBinding
 import com.celzero.bravedns.iab.BillingListener
+import com.celzero.bravedns.iab.DeviceNotRegisteredNotifier
 import com.celzero.bravedns.iab.InAppBillingHandler
+import com.celzero.bravedns.iab.InAppBillingHandler.MONEYBACK_WINDOW_DAYS
 import com.celzero.bravedns.iab.ProductDetail
 import com.celzero.bravedns.iab.PurchaseDetail
+import com.celzero.bravedns.iab.PurchaseConflictNotifier
 import com.celzero.bravedns.iab.ServerApiError
+import com.celzero.bravedns.ui.activity.CustomerSupportActivity
 import com.celzero.bravedns.ui.activity.FragmentHostActivity
+import com.celzero.bravedns.ui.bottomsheet.DeviceAuthErrorBottomSheet
+import com.celzero.bravedns.ui.bottomsheet.DeviceNotRegisteredBottomSheet
+import com.celzero.bravedns.ui.bottomsheet.PurchaseConflictBottomSheet
 import com.celzero.bravedns.ui.bottomsheet.PurchaseProcessingBottomSheet
 import com.celzero.bravedns.ui.dialog.SubscriptionAnimDialog
 import com.celzero.bravedns.util.Logger
@@ -48,12 +56,11 @@ import com.celzero.bravedns.util.Logger.LOG_TAG_UI
 import com.celzero.bravedns.util.UIUtils
 import com.celzero.bravedns.util.UIUtils.htmlToSpannedText
 import com.celzero.bravedns.util.Utilities
-import java.util.Locale
 import com.celzero.bravedns.viewmodel.RethinkPlusViewModel
 import com.celzero.bravedns.viewmodel.SubscriptionUiState
 import com.facebook.shimmer.Shimmer
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -104,6 +111,7 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
     override fun onResume() {
         super.onResume()
         if (b.loadingContainer.isVisible) startShimmer()
+        startHeaderAnimations()
         if (shouldRecheckOnResume) {
             shouldRecheckOnResume = false
             viewModel.initializeBilling()
@@ -124,40 +132,44 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
     override fun onPause() {
         super.onPause()
         stopShimmer()
+        stopHeaderAnimations()
     }
 
     override fun onDestroyView() {
         super.onDestroyView()
+        Logger.d(Logger.LOG_IAB, "$TAG: onDestroyView called")
+        stopHeaderAnimations()
         cancelProcessingTimeout()
         dismissProcessingBottomSheet()
+        InAppBillingHandler.unregisterListener(this)
         adapter = null
     }
 
     private fun setupUI() {
-        b.fhsTitleRethink.text = getString(R.string.rpn_title).lowercase()
         applyButtonTheme()
         setupRecyclerView()
         setupTermsAndPolicy()
         setupProductTypeToggle()
         adjustCtaBottomMargin()
+        startHeaderAnimations()
 
         if (viewModel.extendMode) {
             // In extend mode: hide the tab toggle and the page title,show only one-time products.
-            b.productTypeToggle.isVisible = false
+            b.productTypeToggleContainer.isVisible = false
             // Show the extend-mode banner so the user knows they are adding more access time.
             b.extendModeBanner.isVisible = true
             // hide the connection info card since it's not relevant in extend mode
             b.connectionInfoCard.visibility = View.GONE
-            }
         }
+    }
 
     private fun applyButtonTheme() {
         val ctx = requireContext()
 
         // subscribe button
         val accentGood = UIUtils.fetchColor(ctx, R.attr.accentGood)
-        val lightText  = UIUtils.fetchColor(ctx, R.attr.primaryLightColorText)
-        val htxtClr = UIUtils.fetchColor(ctx, R.attr.homeScreenHeaderTextColor)
+        val lightText = UIUtils.fetchColor(ctx, R.attr.primaryLightColorText)
+        val htxtClr = UIUtils.fetchColor(ctx, R.attr.homeScreenBtnBackground)
 
         b.subscribeButton.apply {
             backgroundTintList = android.content.res.ColorStateList.valueOf(accentGood)
@@ -230,25 +242,34 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
     }
 
     private fun updateToggleState(selectedType: RethinkPlusViewModel.ProductTypeFilter) {
+        val ctx = requireContext()
+        val surfaceColor = UIUtils.fetchColor(ctx, R.attr.background)
+        val onSurfaceColor = UIUtils.fetchColor(ctx, R.attr.colorOnSurface)
+        val lightTextColor = UIUtils.fetchColor(ctx, R.attr.primaryLightColorText)
+
         when (selectedType) {
             RethinkPlusViewModel.ProductTypeFilter.SUBSCRIPTION -> {
                 b.btnSubscription.apply {
-                    setBackgroundColor(UIUtils.fetchColor(requireContext(), R.attr.primaryColor))
-                    setTextColor(UIUtils.fetchColor(requireContext(), R.attr.accentGood))
+                    setBackgroundColor(surfaceColor)
+                    setTextColor(onSurfaceColor)
+                    typeface = android.graphics.Typeface.DEFAULT_BOLD
                 }
                 b.btnOneTime.apply {
                     setBackgroundColor(Color.TRANSPARENT)
-                    setTextColor(UIUtils.fetchColor(requireContext(), R.attr.primaryTextColor))
+                    setTextColor(lightTextColor)
+                    typeface = android.graphics.Typeface.DEFAULT
                 }
             }
             RethinkPlusViewModel.ProductTypeFilter.ONE_TIME -> {
                 b.btnOneTime.apply {
-                    setBackgroundColor(UIUtils.fetchColor(requireContext(), R.attr.primaryColor))
-                    setTextColor(UIUtils.fetchColor(requireContext(), R.attr.accentGood))
+                    setBackgroundColor(surfaceColor)
+                    setTextColor(onSurfaceColor)
+                    typeface = android.graphics.Typeface.DEFAULT_BOLD
                 }
                 b.btnSubscription.apply {
                     setBackgroundColor(Color.TRANSPARENT)
-                    setTextColor(UIUtils.fetchColor(requireContext(), R.attr.primaryTextColor))
+                    setTextColor(lightTextColor)
+                    typeface = android.graphics.Typeface.DEFAULT
                 }
             }
         }
@@ -299,14 +320,7 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
     }
 
     private fun openHelpAndSupport() {
-        val args = Bundle().apply { putString("ARG_KEY", "Launch_Rethink_Support_Dashboard") }
-        startActivity(
-            FragmentHostActivity.createIntent(
-                context = requireContext(),
-                fragmentClass = RethinkPlusDashboardFragment::class.java,
-                args = args
-            )
-        )
+        CustomerSupportActivity.start(requireContext())
     }
 
     private fun setupObservers() {
@@ -328,7 +342,8 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
             viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
                 viewModel.selectedProduct.collect { selection ->
                     adapter?.setSelectedProduct(selection?.first, selection?.second)
-                    updateMoneyBackBadge(selection?.first, selection?.second)
+                    updateMoneyBackBadge()
+                    updateCancelPolicyText(selection?.first, selection?.second)
                 }
             }
         }
@@ -402,17 +417,14 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
             cancelProcessingTimeout()
             dismissProcessingBottomSheet()
             when (error) {
-                is ServerApiError.Unauthorized401 -> {
-                    showTransactionError(getString(R.string.subscription_action_failed))
-                }
-
-                is ServerApiError.Conflict409 -> {
-                    showTransactionError(getString(R.string.subscription_action_failed))
-                }
-
-                else -> {
-                    /* GenericError / NetworkError / DeviceNotRegistered handled elsewhere or via toast */
-                }
+                is ServerApiError.Conflict409 -> showConflictBottomSheet(error)
+                is ServerApiError.Unauthorized401 -> showDeviceAuthErrorBottomSheet(error)
+                is ServerApiError.DeviceNotRegistered -> showDeviceNotRegisteredBottomSheet(error)
+                is ServerApiError.GenericError -> showTransactionError(error.message)
+                is ServerApiError.NetworkError -> showTransactionError(
+                    error.message ?: getString(R.string.subscription_action_failed)
+                )
+                is ServerApiError.None -> Unit
             }
         }
         // Google Play services interrupted / fatal billing error. Surface a
@@ -426,6 +438,41 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
                 }
             }
         }
+    }
+
+    private fun showDeviceNotRegisteredBottomSheet(error: ServerApiError.DeviceNotRegistered) {
+        if (!isAdded) return
+        if (isStateSaved) {
+            showTransactionError(getString(R.string.subscription_action_failed))
+            return
+        }
+        if (childFragmentManager.findFragmentByTag("deviceNotRegistered") != null) return
+        DeviceNotRegisteredNotifier.cancel(requireContext())
+        DeviceNotRegisteredBottomSheet.newInstance(error)
+            .show(childFragmentManager, "deviceNotRegistered")
+    }
+
+    private fun showDeviceAuthErrorBottomSheet(error: ServerApiError.Unauthorized401) {
+        if (!isAdded) return
+        if (isStateSaved) {
+            showTransactionError(getString(R.string.subscription_action_failed))
+            return
+        }
+        if (childFragmentManager.findFragmentByTag("deviceAuthError401") != null) return
+        DeviceAuthErrorBottomSheet.newInstance(error)
+            .show(childFragmentManager, "deviceAuthError401")
+    }
+
+    private fun showConflictBottomSheet(error: ServerApiError.Conflict409) {
+        if (!isAdded) return
+        if (isStateSaved) {
+            showTransactionError(getString(R.string.subscription_action_failed))
+            return
+        }
+        if (childFragmentManager.findFragmentByTag("conflict409") != null) return
+        PurchaseConflictNotifier.cancel(requireContext())
+        PurchaseConflictBottomSheet.newInstance(error)
+            .show(childFragmentManager, "conflict409")
     }
 
     private fun handleUiState(state: SubscriptionUiState) {
@@ -469,7 +516,7 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
         b.scrollView.isVisible = true
         b.ctaContainer.isVisible = true
 
-        b.ctaContainer.post { syncScrollBottomPaddingWithCta() }
+        b.ctaContainer.doOnNextLayout { syncScrollBottomPaddingWithCta() }
 
         Logger.i(LOG_TAG_UI, "$TAG: Ready: ${products.size} products, resubscribe=$isResubscribe")
 
@@ -524,6 +571,8 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
             b.ispContainer.isVisible = false
             b.vDivider.isVisible = false
         }
+        b.ispContainer.isVisible = false
+        b.vDivider.isVisible = false
     }
 
     private fun showProcessing(message: String) {
@@ -561,6 +610,7 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
         b.errorIcon.setImageResource(R.drawable.ic_error_state)
         b.errorTitle.text = getString(R.string.no_internet_title)
         b.errorMessage.text = message.ifBlank { getString(R.string.no_internet_premium_msg) }
+        b.errorMessage.isVisible = true
         b.errorReason.isVisible = false
         b.retryButton.isVisible = true
     }
@@ -626,11 +676,15 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
 
         b.errorContainer.isVisible = true
         b.errorTitle.text = title
-        b.errorMessage.text = message
-        // Render the specific failure cause (if any) in a small text element directly below
-        // the primary error message so the user understands why the fetch failed.
-        b.errorReason.text = reason
-        b.errorReason.isVisible = reason.isNotEmpty()
+        if (reason.isNotEmpty()) {
+            b.errorMessage.isVisible = false
+            b.errorReason.text = reason
+            b.errorReason.isVisible = true
+        } else {
+            b.errorMessage.text = message
+            b.errorMessage.isVisible = true
+            b.errorReason.isVisible = false
+        }
         b.retryButton.isVisible = isRetryable
     }
 
@@ -660,6 +714,7 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
         b.errorContainer.isVisible = true
         b.errorTitle.text = title
         b.errorMessage.text = fullMessage
+        b.errorMessage.isVisible = true
         b.errorReason.isVisible = false
         b.retryButton.isVisible = canRetry
     }
@@ -734,8 +789,10 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
      * Initiate a purchase for the currently selected plan.
      */
     private fun purchaseSubscription() {
+        purchaseInFlight = true
         val selection = viewModel.selectedProduct.value
         if (selection == null) {
+            purchaseInFlight = false
             Utilities.showToastUiCentered(
                 requireContext(),
                 getString(R.string.select_plan_first),
@@ -747,6 +804,7 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
         // check connectivity before launching the purchase flow so the
         // user gets a clear "No internet" message instead of a spinner-then-generic-error.
         if (!isOnline()) {
+            purchaseInFlight = false
             Utilities.showToastUiCentered(
                 requireContext(),
                 getString(R.string.no_internet_purchase_msg),
@@ -863,6 +921,34 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
         }
     }
 
+    /**
+     * Explicitly restore purchases. Re-queries Google Play; the resulting
+     * state-machine transition drives the UI.
+     */
+    private fun restorePurchases() {
+        if (!isOnline()) {
+            Utilities.showToastUiCentered(
+                requireContext(),
+                getString(R.string.no_internet_purchase_msg),
+                Toast.LENGTH_LONG
+            )
+            return
+        }
+        lifecycleScope.launch(Dispatchers.IO) {
+            InAppBillingHandler.fetchPurchases(
+                listOf(
+                    com.android.billingclient.api.BillingClient.ProductType.SUBS,
+                    com.android.billingclient.api.BillingClient.ProductType.INAPP
+                )
+            )
+        }
+        Utilities.showToastUiCentered(
+            requireContext(),
+            getString(R.string.pending_checking_status),
+            Toast.LENGTH_SHORT
+        )
+    }
+
 
     private fun startShimmer() {
         if (!b.shimmerContainer.isShimmerStarted) {
@@ -900,12 +986,29 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
     private fun updateHtmlEncodedText(text: String): Spanned =
         htmlToSpannedText(text)
 
+    // The header hosts a self-contained ocean scene (DolphinOceanView) that
+    // draws the water surface, the dolphin breach cycle, splashes and sparse
+    // bubbles. The fragment only drives its lifecycle.
+    private fun startHeaderAnimations() {
+        b.dolphinOcean.start()
+    }
+
+    private fun stopHeaderAnimations() {
+        b.dolphinOcean.stop()
+    }
+
     override fun onConnectionResult(isSuccess: Boolean, message: String) {
         viewModel.onBillingConnected(isSuccess, message)
     }
 
     override fun purchasesResult(isSuccess: Boolean, purchaseDetailList: List<PurchaseDetail>) {
         // handled by state machine via InAppBillingHandler.
+    }
+
+    override fun purchaseRejected() {
+        Logger.d(Logger.LOG_IAB, "$TAG: purchase rejected by state machine")
+        purchaseInFlight = false
+        cancelProcessingTimeout()
     }
 
     override fun productResult(isSuccess: Boolean, productList: List<ProductDetail>) {
@@ -916,25 +1019,27 @@ class RethinkPlusFragment : Fragment(R.layout.fragment_rethink_plus_premium),
         viewModel.selectProduct(productId, planId)
     }
 
-    private fun updateMoneyBackBadge(productId: String?, planId: String?) {
+    private fun updateMoneyBackBadge() {
+        b.moneyBackBadge.setDays(MONEYBACK_WINDOW_DAYS)
+    }
+
+    private fun updateCancelPolicyText(productId: String?, planId: String?) {
         var days = when (productId) {
-            InAppBillingHandler.SUBS_PRODUCT_MONTHLY -> InAppBillingHandler.MONEYBACK_WINDOW_SUBS_MONTHLY_DAYS
-            InAppBillingHandler.SUBS_PRODUCT_YEARLY -> InAppBillingHandler.MONEYBACK_WINDOW_SUBS_YEARLY_DAYS
-            InAppBillingHandler.ONE_TIME_PRODUCT_2YRS -> InAppBillingHandler.MONEYBACK_WINDOW_ONE_TIME_2YRS_DAYS
-            InAppBillingHandler.ONE_TIME_PRODUCT_5YRS -> InAppBillingHandler.MONEYBACK_WINDOW_ONE_TIME_5YRS_DAYS
+            InAppBillingHandler.SUBS_PRODUCT_MONTHLY -> InAppBillingHandler.REVOKE_WINDOW_SUBS_MONTHLY_DAYS
+            InAppBillingHandler.SUBS_PRODUCT_YEARLY -> InAppBillingHandler.REVOKE_WINDOW_SUBS_YEARLY_DAYS
+            InAppBillingHandler.ONE_TIME_PRODUCT_2YRS -> InAppBillingHandler.REVOKE_WINDOW_ONE_TIME_2YRS_DAYS
+            InAppBillingHandler.ONE_TIME_PRODUCT_5YRS -> InAppBillingHandler.REVOKE_WINDOW_ONE_TIME_5YRS_DAYS
             else -> 0
         }
-
         if (days == 0) {
             days = when (planId) {
-                InAppBillingHandler.SUBS_PRODUCT_MONTHLY -> InAppBillingHandler.MONEYBACK_WINDOW_SUBS_MONTHLY_DAYS
-                InAppBillingHandler.SUBS_PRODUCT_YEARLY -> InAppBillingHandler.MONEYBACK_WINDOW_SUBS_YEARLY_DAYS
-                InAppBillingHandler.ONE_TIME_PRODUCT_2YRS -> InAppBillingHandler.MONEYBACK_WINDOW_ONE_TIME_2YRS_DAYS
-                InAppBillingHandler.ONE_TIME_PRODUCT_5YRS -> InAppBillingHandler.MONEYBACK_WINDOW_ONE_TIME_5YRS_DAYS
+                InAppBillingHandler.SUBS_PRODUCT_MONTHLY -> InAppBillingHandler.REVOKE_WINDOW_SUBS_MONTHLY_DAYS
+                InAppBillingHandler.SUBS_PRODUCT_YEARLY -> InAppBillingHandler.REVOKE_WINDOW_SUBS_YEARLY_DAYS
+                InAppBillingHandler.ONE_TIME_PRODUCT_2YRS -> InAppBillingHandler.REVOKE_WINDOW_ONE_TIME_2YRS_DAYS
+                InAppBillingHandler.ONE_TIME_PRODUCT_5YRS -> InAppBillingHandler.REVOKE_WINDOW_ONE_TIME_5YRS_DAYS
                 else -> 7
-            }
+                }
         }
-
-        b.moneyBackBadge.setDays(days)
+        b.cancelPolicy.text = getString(R.string.cancel_refund_policy, days.toString())
     }
 }

@@ -25,6 +25,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import androidx.core.view.isVisible
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.findViewTreeLifecycleOwner
 import androidx.lifecycle.lifecycleScope
@@ -48,6 +49,7 @@ import com.celzero.bravedns.service.WireguardManager.WG_UPTIME_THRESHOLD
 import com.celzero.bravedns.ui.activity.WgConfigDetailActivity
 import com.celzero.bravedns.ui.activity.WgConfigDetailActivity.Companion.INTENT_EXTRA_WG_TYPE
 import com.celzero.bravedns.ui.activity.WgConfigEditorActivity.Companion.INTENT_EXTRA_WG_ID
+import com.celzero.bravedns.util.StatusTicker
 import com.celzero.bravedns.util.UIUtils
 import com.celzero.bravedns.util.UIUtils.fetchColor
 import com.celzero.bravedns.util.Utilities
@@ -59,11 +61,15 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.time.Duration.Companion.milliseconds
 
 class OneWgConfigAdapter(private val context: Context, private val listener: DnsStatusListener, private val eventLogger: EventLogger) :
     PagingDataAdapter<WgConfigFiles, OneWgConfigAdapter.WgInterfaceViewHolder>(DIFF_CALLBACK) {
 
     private var lifecycleOwner: LifecycleOwner? = null
+
+    // RecyclerView callbacks run on the main thread, so no synchronization is needed.
+    private val activeHolders = mutableSetOf<WgInterfaceViewHolder>()
 
     interface DnsStatusListener {
         fun onDnsStatusChanged()
@@ -91,7 +97,18 @@ class OneWgConfigAdapter(private val context: Context, private val listener: Dns
             }
     }
 
+    override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
+        super.onDetachedFromRecyclerView(recyclerView)
+        statusTicker.cancel()
+        statusHolders.clear()
+        activeHolders.clear()
+        lifecycleOwner = null
+    }
+
     override fun onBindViewHolder(holder: WgInterfaceViewHolder, position: Int) {
+        if (lifecycleOwner == null) {
+            lifecycleOwner = holder.itemView.findViewTreeLifecycleOwner()
+        }
         val wgConfigFiles: WgConfigFiles = getItem(position) ?: return
         holder.update(wgConfigFiles)
     }
@@ -106,7 +123,7 @@ class OneWgConfigAdapter(private val context: Context, private val listener: Dns
         if (lifecycleOwner == null) {
             lifecycleOwner = parent.findViewTreeLifecycleOwner()
         }
-        return WgInterfaceViewHolder(itemBinding)
+        return WgInterfaceViewHolder(itemBinding).also { activeHolders.add(it) }
     }
 
     override fun onViewDetachedFromWindow(holder: WgInterfaceViewHolder) {
@@ -114,11 +131,50 @@ class OneWgConfigAdapter(private val context: Context, private val listener: Dns
         holder.cancelJobIfAny()
     }
 
+    private val statusHolders = mutableListOf<WgInterfaceViewHolder>()
+    private val statusTicker = StatusTicker()
+
+    private fun registerForStatusUpdates(holder: WgInterfaceViewHolder) {
+        if (statusHolders.contains(holder)) return
+        statusHolders.add(holder)
+        if (!ensureStatusTicker()) refreshStatuses()
+    }
+
+    private fun ensureStatusTicker(): Boolean {
+        val owner = lifecycleOwner ?: return false
+        return statusTicker.start(owner.lifecycleScope, DELAY_MS) { refreshStatuses() }
+    }
+
+    private fun refreshStatuses(): Boolean {
+        val iterator = statusHolders.iterator()
+        val active = ArrayList<WgInterfaceViewHolder>()
+        while (iterator.hasNext()) {
+            val holder = iterator.next()
+            val lifecycleActive =
+                lifecycleOwner?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.STARTED) == true
+            if (!lifecycleActive || holder.bindingAdapterPosition == RecyclerView.NO_POSITION) {
+                iterator.remove()
+                continue
+            }
+            active.add(holder)
+        }
+        if (active.isEmpty()) {
+            statusTicker.cancel()
+            return false
+        }
+        io {
+            active.forEach { it.pollStatus() }
+        }
+        return true
+    }
+
     inner class WgInterfaceViewHolder(private val b: ListItemWgOneInterfaceBinding) :
         RecyclerView.ViewHolder(b.root) {
-        private var job: Job? = null
+
+        private var boundConfig: WgConfigFiles? = null
 
         fun update(config: WgConfigFiles) {
+            boundConfig = config
             b.interfaceNameText.text = config.name
             b.interfaceNameText.isSelected = true
             b.interfaceIdText.text = context.getString(R.string.single_argument_parenthesis, config.id.toString())
@@ -129,7 +185,7 @@ class OneWgConfigAdapter(private val context: Context, private val listener: Dns
                 updateFlag(null, config.id)
             }
             if (isWgActive) {
-                keepStatusUpdated(config)
+                registerForStatusUpdates(this)
             } else {
                 cancelJobIfAny()
                 disableInterface()
@@ -137,18 +193,15 @@ class OneWgConfigAdapter(private val context: Context, private val listener: Dns
         }
 
         fun cancelJobIfAny() {
-            if (job?.isActive == true) {
-                job?.cancel()
+            statusHolders.remove(this)
+            if (statusHolders.isEmpty()) {
+                statusTicker.cancel()
             }
         }
 
-        private fun keepStatusUpdated(config: WgConfigFiles) {
-            job = io {
-                while (true) {
-                    updateStatus(config)
-                    delay(DELAY_MS)
-                }
-            }
+        suspend fun pollStatus() {
+            val config = boundConfig ?: return
+            updateStatus(config)
         }
 
         private fun updateProtocolChip(pair: Pair<Boolean, Boolean>) {
@@ -180,14 +233,12 @@ class OneWgConfigAdapter(private val context: Context, private val listener: Dns
         }
 
         private suspend fun updateStatus(config: WgConfigFiles) {
-            // if the view is not active then cancel the job
             if (
                 lifecycleOwner
                     ?.lifecycle
                     ?.currentState
                     ?.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED) == false
             ) {
-                job?.cancel()
                 return
             }
 
@@ -275,8 +326,8 @@ class OneWgConfigAdapter(private val context: Context, private val listener: Dns
             val isFailing = now - since > WG_UPTIME_THRESHOLD && lastOk == 0L
             return when (status) {
                 UIUtils.ProxyStatus.TOK -> if (isFailing) R.attr.chipTextNeutral else R.attr.accentGood
-                UIUtils.ProxyStatus.TUP, UIUtils.ProxyStatus.TZZ, UIUtils.ProxyStatus.TNT -> R.attr.chipTextNeutral
-                else -> R.attr.chipTextNegative // TKO, TEND
+                UIUtils.ProxyStatus.TUP, UIUtils.ProxyStatus.TZZ -> R.attr.chipTextNeutral
+                else -> R.attr.chipTextNegative // TKO, TEND, TNT
             }
         }
 
@@ -343,7 +394,12 @@ class OneWgConfigAdapter(private val context: Context, private val listener: Dns
 
             if (ip.isNullOrBlank()) {
                 val c = WireguardManager.getConfigById(configId)
-                val host = c?.getPeers()?.getOrNull(0)?.getEndpoint()?.orElse(null)?.host
+                val host =
+                    c?.getPeers()
+                        ?.getOrNull(0)
+                        ?.getEndpoint()
+                        ?.orElse(null)
+                        ?.let { stripPort(it) }
                 if (!host.isNullOrBlank() && HostName(host).asAddress() != null) {
                     ip = host
                 }
@@ -559,7 +615,15 @@ class OneWgConfigAdapter(private val context: Context, private val listener: Dns
     }
 
     private suspend fun uiCtx(f: suspend () -> Unit) {
-        withContext(Dispatchers.Main) { f() }
+        val owner = context as? LifecycleOwner ?: return
+
+        withContext(Dispatchers.Main.immediate) {
+            if (!owner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                return@withContext
+            }
+
+            f()
+        }
     }
 
     private fun io(f: suspend () -> Unit): Job? {

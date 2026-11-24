@@ -28,8 +28,10 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "tailscale.com/feature/condregister" // register optional features
@@ -55,6 +57,7 @@ import (
 	"tailscale.com/tsd"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
+	"tailscale.com/types/nettype"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/netstack"
 )
@@ -126,6 +129,168 @@ type Engine struct {
 	// reach the tailnet, bypassing Rethink's per-app assignment.
 	socksUser string
 	socksPass string
+
+	// inboundTCPAllow is the live inbound TCP allowlist: destination ports
+	// on this node's Tailscale IP that netstack forwards to 127.0.0.1.
+	// Default (nil pointer, hence an empty slice) rejects everything. Swapped
+	// atomically by SetInboundTCPPorts, so live updates need neither an
+	// engine nor a netstack restart.
+	inboundTCPAllow atomic.Pointer[[]portRange]
+}
+
+// portRange is an inclusive destination-port range.
+type portRange struct {
+	start uint16
+	end   uint16
+}
+
+// inboundHardDenyTCPPorts are destination ports this engine itself listens on
+// (its local DNS relay and SOCKS5). They are denied even if they ever landed
+// inside an allowlisted range.
+var inboundHardDenyTCPPorts = []uint16{
+	netip.MustParseAddrPort(DNSAddr).Port(),
+	netip.MustParseAddrPort(Socks5Addr).Port(),
+}
+
+// inboundReservedTCPPorts names the ports above for error messages.
+var inboundReservedTCPPorts = map[uint16]string{
+	netip.MustParseAddrPort(DNSAddr).Port():    "DNS relay",
+	netip.MustParseAddrPort(Socks5Addr).Port(): "SOCKS5 proxy",
+}
+
+// parseInboundTCPPorts parses a comma-separated user spec of single ports
+// ("12100") and inclusive ranges ("12070-12108") into an allowlist. An empty
+// or whitespace-only spec yields an empty (reject-all) allowlist.
+//
+// Ports are validated to 1..65535 with start <= end, and no port or range may
+// cover one of the engine's own reserved ports (1053 DNS relay, 1055 SOCKS5).
+// Everything is validated before anything is returned, so callers never see a
+// partial parse.
+func parseInboundTCPPorts(spec string) ([]portRange, error) {
+	trimmed := strings.TrimSpace(spec)
+	if trimmed == "" {
+		return nil, nil
+	}
+	out := make([]portRange, 0, strings.Count(trimmed, ",")+1)
+	for _, token := range strings.Split(trimmed, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			return nil, fmt.Errorf("inbound tcp ports: empty entry in %q", spec)
+		}
+		var start, end uint64
+		switch hyphens := strings.Count(token, "-"); {
+		case hyphens == 0:
+			p, err := parseSinglePort(token)
+			if err != nil {
+				return nil, err
+			}
+			start, end = uint64(p), uint64(p)
+		case hyphens == 1:
+			i := strings.Index(token, "-")
+			lo, hi := strings.TrimSpace(token[:i]), strings.TrimSpace(token[i+1:])
+			if lo == "" || hi == "" {
+				return nil, fmt.Errorf("inbound tcp ports: incomplete range %q", token)
+			}
+			p, err := parseSinglePort(lo)
+			if err != nil {
+				return nil, err
+			}
+			q, err := parseSinglePort(hi)
+			if err != nil {
+				return nil, err
+			}
+			if p > q {
+				return nil, fmt.Errorf("inbound tcp ports: range %q starts after it ends", token)
+			}
+			start, end = uint64(p), uint64(q)
+		default:
+			return nil, fmt.Errorf("inbound tcp ports: malformed entry %q", token)
+		}
+		rng := portRange{start: uint16(start), end: uint16(end)}
+		for _, reserved := range inboundHardDenyTCPPorts {
+			if uint64(reserved) < start || uint64(reserved) > end {
+				continue
+			}
+			return nil, fmt.Errorf("inbound tcp ports: %q covers reserved port %d (%s)",
+				token, reserved, inboundReservedTCPPorts[reserved])
+		}
+		out = append(out, rng)
+	}
+	return out, nil
+}
+
+// parseSinglePort validates one decimal port number in 1..65535.
+func parseSinglePort(token string) (uint16, error) {
+	p, err := strconv.ParseUint(token, 10, 32)
+	if err != nil || p < 1 || p > 65535 {
+		return 0, fmt.Errorf("inbound tcp ports: %q is not a port in 1..65535", token)
+	}
+	return uint16(p), nil
+}
+
+// SetInboundTCPPorts replaces the inbound TCP allowlist.
+// Empty or whitespace-only spec clears the allowlist (reject all inbound TCP) and returns nil.
+// Otherwise parses comma-separated single ports ("12100") and inclusive ranges ("12070-12108"),
+// tolerating surrounding whitespace. Takes effect immediately; no engine/netstack restart.
+// On any error the previous allowlist is left unchanged.
+func (e *Engine) SetInboundTCPPorts(spec string) error {
+	ranges, err := parseInboundTCPPorts(spec)
+	if err != nil {
+		return err
+	}
+	if e == nil {
+		// nothing to install on (gomobile nil peer); still validate above
+		return nil
+	}
+	next := make([]portRange, len(ranges))
+	copy(next, ranges)
+	e.inboundTCPAllow.Store(&next)
+	log.Printf("ts-engine: inbound tcp allowlist: %q", spec)
+	return nil
+}
+
+// inboundTCPAllowlist returns the current allowlist; nil (or empty) means
+// reject-all.
+func (e *Engine) inboundTCPAllowlist() []portRange {
+	if e == nil {
+		return nil
+	}
+	p := e.inboundTCPAllow.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// inboundTCPHandler decides whether an inbound TCP flow to this node's
+// Tailscale IP should be forwarded to 127.0.0.1 or rejected. Installed as a
+// method value on the Engine so it consults the *current* allowlist on every
+// flow (see NewEngine).
+//
+// Returns (nil, false) to let netstack forward to 127.0.0.1:<dst.Port()>.
+// Returns (nil, true) to make netstack reject (RST) and never forward.
+func (e *Engine) inboundTCPHandler(src, dst netip.AddrPort) (func(net.Conn), bool) {
+	port := dst.Port()
+	// belt-and-suspenders: never expose the engine's own listeners, even if
+	// a caller somehow sneaked them into the allowlist
+	for _, deny := range inboundHardDenyTCPPorts {
+		if port == deny {
+			return nil, true
+		}
+	}
+	for _, rng := range e.inboundTCPAllowlist() {
+		if port >= rng.start && port <= rng.end {
+			return nil, false // default forwarding to 127.0.0.1:<port>
+		}
+	}
+	return nil, true
+}
+
+// inboundUDPHandler always rejects inbound UDP so netstack never forwards it
+// to 127.0.0.1 (protecting the DNS relay on UDP 1053), whatever the TCP
+// allowlist says. Rethink's inbound forwarding is TCP-only.
+func inboundUDPHandler(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
+	return nil, true
 }
 
 // NewEngine constructs an Engine. stateDir persists node identity across app
@@ -221,12 +386,30 @@ func NewEngine(stateDir string, cb Callback) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("netstack: %w", err)
 	}
-	// SECURITY: must stay false. When true, netstack rewrites inbound tailnet
-	// TCP/UDP aimed at this node's own Tailscale IP to 127.0.0.1:<port>,
-	// exposing every loopback listener on the device (this engine's SOCKS5
-	// and DNS relay, plus other apps' local servers) to any tailnet peer the
-	// ACL lets reach this node. This node only originates connections.
-	ns.ProcessLocalIPs = false
+	// SECURITY: inbound tailnet flows aimed at this node's own Tailscale IP
+	// are default-deny (same posture tsnet relies on). ProcessLocalIPs is
+	// true so that allowlisted inbound TCP can be rewritten by netstack to
+	// 127.0.0.1:<port>; GetTCPHandlerForFlow then default-denies every
+	// destination port except the runtime allowlist installed by
+	// SetInboundTCPPorts (default empty = reject all inbound TCP), and
+	// hard-denies 1053 (this engine's DNS relay) and 1055 (this engine's
+	// SOCKS5) even if they were ever in that allowlist. Denied flows are
+	// RST by netstack and never reach loopback, so no other loopback
+	// listener (this engine's SOCKS5/DNS, or another app's local server) is
+	// exposed to the tailnet. GetUDPHandlerForFlow rejects every inbound UDP
+	// unconditionally — with ProcessLocalIPs true and no handler installed,
+	// netstack would forward all of it to 127.0.0.1, exposing the DNS relay
+	// on UDP 1053 to any tailnet peer — so inbound forwarding is TCP-only.
+	// A nil GetTCPHandlerForFlow (or GetUDPHandlerForFlow) would forward
+	// everything, which is why both must always be installed.
+	//
+	// The Engine is allocated first (empty allowlist) and the handlers are
+	// method values on it: they read the live allowlist on every flow, so
+	// SetInboundTCPPorts takes effect without restarting anything.
+	e := &Engine{cb: cb, sys: sys, ns: ns, dialer: dialer, dns: sys.DNSManager.Get()}
+	ns.ProcessLocalIPs = true
+	ns.GetTCPHandlerForFlow = e.inboundTCPHandler
+	ns.GetUDPHandlerForFlow = inboundUDPHandler
 	// ...but replies to connections this node originated (and nothing else)
 	// must still reach netstack: admit only packets matching an existing
 	// gVisor endpoint. Without this, every outbound tailnet dial times out
@@ -243,9 +426,10 @@ func NewEngine(stateDir string, cb Callback) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("local backend: %w", err)
 	}
+	e.lb = lb
 
 	hostinfo.SetApp("rethink-dns")
-	return &Engine{cb: cb, sys: sys, lb: lb, ns: ns, dialer: dialer, dns: sys.DNSManager.Get()}, nil
+	return e, nil
 }
 
 // Start boots the backend, routes the dialer through netstack, and serves the

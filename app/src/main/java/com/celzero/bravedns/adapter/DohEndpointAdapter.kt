@@ -26,6 +26,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.findViewTreeLifecycleOwner
 import androidx.lifecycle.lifecycleScope
@@ -33,6 +34,8 @@ import androidx.paging.PagingDataAdapter
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
 import com.celzero.bravedns.R
+import com.celzero.bravedns.util.SelectionIndicator
+import com.celzero.bravedns.util.StatusTicker
 import com.celzero.bravedns.customdownloader.IpInfoDownloader
 import com.celzero.bravedns.data.AppConfig
 import com.celzero.bravedns.database.DoHEndpoint
@@ -45,8 +48,6 @@ import com.celzero.bravedns.util.Utilities
 import com.celzero.firestack.backend.Backend
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -54,6 +55,12 @@ class DohEndpointAdapter(private val context: Context, private val appConfig: Ap
     PagingDataAdapter<DoHEndpoint, DohEndpointAdapter.DoHEndpointViewHolder>(DIFF_CALLBACK) {
 
     var lifecycleOwner: LifecycleOwner? = null
+
+    // RecyclerView callbacks run on the main thread, so no synchronization is needed.
+    private val activeHolders = mutableSetOf<DoHEndpointViewHolder>()
+
+    private val statusHolders = mutableListOf<DoHEndpointViewHolder>()
+    private val statusTicker = StatusTicker()
 
     companion object {
         private const val ONE_SEC = 1000L
@@ -82,27 +89,98 @@ class DohEndpointAdapter(private val context: Context, private val appConfig: Ap
         val itemBinding =
             ListItemEndpointBinding.inflate(LayoutInflater.from(parent.context), parent, false)
         lifecycleOwner = parent.findViewTreeLifecycleOwner()
-        return DoHEndpointViewHolder(itemBinding)
+        return DoHEndpointViewHolder(itemBinding).also { activeHolders.add(it) }
+    }
+
+    override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
+        super.onDetachedFromRecyclerView(recyclerView)
+        statusTicker.cancel()
+        statusHolders.clear()
+        activeHolders.clear()
+        lifecycleOwner = null
+    }
+
+    private fun registerForStatusUpdates(holder: DoHEndpointViewHolder) {
+        if (statusHolders.contains(holder)) return
+        statusHolders.add(holder)
+        if (!ensureStatusTicker()) refreshSelectedStatuses()
+    }
+
+    private fun ensureStatusTicker(): Boolean {
+        val owner = lifecycleOwner ?: return false
+        return statusTicker.start(owner.lifecycleScope, ONE_SEC) { refreshSelectedStatuses() }
+    }
+
+    private fun refreshSelectedStatuses(): Boolean {
+        val iterator = statusHolders.iterator()
+        val active = ArrayList<DoHEndpointViewHolder>()
+        while (iterator.hasNext()) {
+            val holder = iterator.next()
+            val lifecycleActive =
+                lifecycleOwner?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.STARTED) == true
+            if (!lifecycleActive || holder.bindingAdapterPosition == RecyclerView.NO_POSITION) {
+                iterator.remove()
+                continue
+            }
+            active.add(holder)
+        }
+        if (active.isEmpty()) {
+            statusTicker.cancel()
+            return false
+        }
+        io {
+            // always use the id as Dnsx.Preffered as it is the primary dns id for now
+            val state = VpnController.getDnsStatus(Backend.Preferred)
+            val status = getDnsStatusStringRes(state)
+            uiCtx {
+                active.forEach { it.showStatus(status) }
+            }
+        }
+        return true
+    }
+
+    private fun io(f: suspend () -> Unit) {
+        lifecycleOwner?.lifecycleScope?.launch { withContext(Dispatchers.IO) { f() } }
+    }
+
+    private suspend fun uiCtx(f: suspend () -> Unit) {
+        val owner = lifecycleOwner ?: return
+
+        withContext(Dispatchers.Main.immediate) {
+            if (!owner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                return@withContext
+            }
+
+            f()
+        }
     }
 
     override fun onBindViewHolder(holder: DoHEndpointViewHolder, position: Int) {
+        if (lifecycleOwner == null) {
+            lifecycleOwner = holder.itemView.findViewTreeLifecycleOwner()
+        }
         val doHEndpoint: DoHEndpoint = getItem(position) ?: return
         holder.update(doHEndpoint)
     }
 
     inner class DoHEndpointViewHolder(private val b: ListItemEndpointBinding) :
         RecyclerView.ViewHolder(b.root) {
-        private var statusCheckJob: Job? = null
+        private val selectionIndicator =
+            SelectionIndicator(b.endpointSelectionOrbital, b.endpointSelectionPill)
 
         fun update(endpoint: DoHEndpoint) {
             displayDetails(endpoint)
             setupClickListeners(endpoint)
         }
 
+        fun showStatus(statusRes: Int) {
+            b.endpointDesc.text = context.getString(statusRes).replaceFirstChar(Char::titlecase)
+            b.endpointDesc.visibility = View.VISIBLE
+        }
+
         private fun setupClickListeners(endpoint: DoHEndpoint) {
             b.root.setOnClickListener { updateConnection(endpoint) }
             b.endpointInfoImg.setOnClickListener { showExplanationOnImageClick(endpoint) }
-            b.endpointCheck.setOnClickListener { updateConnection(endpoint) }
         }
 
         private fun displayDetails(endpoint: DoHEndpoint) {
@@ -116,13 +194,21 @@ class DohEndpointAdapter(private val context: Context, private val appConfig: Ap
                         context.getString(R.string.lbl_insecure)
                     )
             }
-            b.endpointCheck.isChecked = endpoint.isSelected
+            b.root.contentDescription =
+                context.getString(
+                    if (endpoint.isSelected) R.string.dns_list_item_selected_cd
+                    else R.string.dns_list_item_select_cd,
+                    b.endpointName.text
+                )
+            selectionIndicator.update(endpoint.isSelected)
             if (endpoint.isSelected && VpnController.hasTunnel() && !appConfig.isSmartDnsEnabled()) {
-                keepSelectedStatusUpdated()
+                registerForStatusUpdates(this)
             } else if (endpoint.isSelected) {
+                statusHolders.remove(this)
                 b.endpointDesc.text = context.getString(R.string.rt_filter_parent_selected)
                 b.endpointDesc.visibility = View.VISIBLE
             } else {
+                statusHolders.remove(this)
                 b.endpointDesc.text = ""
                 b.endpointDesc.visibility = View.GONE
             }
@@ -131,44 +217,6 @@ class DohEndpointAdapter(private val context: Context, private val appConfig: Ap
             showIcon(endpoint)
 
             io { updateFlag(endpoint) }
-        }
-
-        private fun keepSelectedStatusUpdated() {
-            statusCheckJob = ui {
-                while (true) {
-                    updateSelectedStatus()
-                    delay(ONE_SEC)
-                }
-            }
-        }
-
-        private fun updateSelectedStatus() {
-            // if the view is not active then cancel the job
-            if (
-                lifecycleOwner
-                    ?.lifecycle
-                    ?.currentState
-                    ?.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED) == false ||
-                bindingAdapterPosition == RecyclerView.NO_POSITION
-            ) {
-                statusCheckJob?.cancel()
-                return
-            }
-
-            updateDnsStatus()
-        }
-
-        private fun updateDnsStatus() {
-            io {
-                // always use the id as Dnsx.Preffered as it is the primary dns id for now
-                val state = VpnController.getDnsStatus(Backend.Preferred)
-                val status = getDnsStatusStringRes(state)
-                uiCtx {
-                    b.endpointDesc.text =
-                        context.getString(status).replaceFirstChar(Char::titlecase)
-                    b.endpointDesc.visibility = View.VISIBLE
-                }
-            }
         }
 
         private fun showIcon(endpoint: DoHEndpoint) {
@@ -207,13 +255,14 @@ class DohEndpointAdapter(private val context: Context, private val appConfig: Ap
 
         private fun showExplanationOnImageClick(endpoint: DoHEndpoint) {
             if (endpoint.isDeletable()) showDeleteDnsDialog(endpoint.id)
-            else showDohMetadataDialog(endpoint.dohName, endpoint.dohURL, endpoint.dohExplanation)
+            else showDohMetadataDialog(endpoint.dohName, endpoint.dohURL, endpoint.dohIp, endpoint.dohExplanation)
         }
 
-        private fun showDohMetadataDialog(title: String, url: String, message: String?) {
+        private fun showDohMetadataDialog(title: String, url: String, ips: String?, message: String?) {
             val builder = MaterialAlertDialogBuilder(context, R.style.App_Dialog_NoDim)
             builder.setTitle(title)
-            builder.setMessage(url + "\n\n" + getDnsDesc(message))
+            val msg = url + if (!ips.isNullOrEmpty()) "\n\n$ips" else "" + "\n\n" + getDnsDesc(message)
+            builder.setMessage(msg)
             builder.setCancelable(true)
             builder.setPositiveButton(context.getString(R.string.dns_info_positive)) { dialogInterface, _ ->
                 dialogInterface.dismiss()
@@ -295,18 +344,6 @@ class DohEndpointAdapter(private val context: Context, private val appConfig: Ap
 
         private fun stripPort(addr: String): String {
             return IpRulesManager.splitHostPort(addr).first
-        }
-
-        private suspend fun uiCtx(f: suspend () -> Unit) {
-            withContext(Dispatchers.Main) { f() }
-        }
-
-        private fun ui(f: suspend () -> Unit): Job? {
-            return lifecycleOwner?.lifecycleScope?.launch { withContext(Dispatchers.Main) { f() } }
-        }
-
-        private fun io(f: suspend () -> Unit) {
-            lifecycleOwner?.lifecycleScope?.launch { withContext(Dispatchers.IO) { f() } }
         }
     }
 }

@@ -22,7 +22,7 @@ tailnet (and exit nodes) without surrendering Rethink's VpnService slot.
 │                                               ▼                                 │
 │  TailscaleManager ◄── state/login events ── Engine (combined gomobile AAR)      │
 │         │                                              │                        │
-│         │ Start/Stop/Login/SetExitNode/SetCorpDNS      ▼                        │
+│         │ Start/Stop/Login/SetExitNode/SetInboundTCPPorts ▼                     │
 │         │                                    tsd.System (userspace)               │
 │         │                                    ├ wgengine (fake tun, started)      │
 │         │                                    ├ netstack                          │
@@ -68,6 +68,23 @@ Key decisions:
      the fake-TUN layer before gVisor ever sees it and blackholes.
    Exit-node traffic works fully regardless of MagicDNS.
 
+5. **Inbound TCP is default-deny.** With `ProcessLocalIPs` on, netstack
+   would otherwise forward every inbound tailnet port to `127.0.0.1`. A
+   TCP handler default-denies every destination port except a runtime
+   allowlist (`Engine.SetInboundTCPPorts`, also in Tailscale settings as
+   **Inbound TCP ports**). In the settings UI users pick one or more starter
+   preset groups (Flux `12070-12108`, ADB over TCP `5555`, KDE Connect
+   `1714-1764`, Termux SSH `8022`, Syncthing `22000`) and/or type their own
+   ports and ranges under Custom; the engine still receives a single combined
+   allowlist built from every selected preset plus Custom. Nothing is
+   selected by default (deny all). Ports 1053 (DNS relay) and 1055 (SOCKS5)
+   can never be allowlisted. UDP is never forwarded. Tailscale's Shields
+   Up, when on, drops inbound connections *before* netstack, so the
+   allowlist has no effect until Shields Up is off. Pair the allowlist
+   with a Tailscale ACL that restricts those ports to trusted nodes;
+   forwarded connections appear to the local app as coming from
+   `127.0.0.1`.
+
 ## Embedding gotchas (all fixed in engine.go, listed here so they stay fixed)
 
 - Go's `net.Interfaces` is blocked for apps on SDK 30+, so `netmon` sources
@@ -93,8 +110,8 @@ Key decisions:
 | Path | Purpose |
 | --- | --- |
 | `tailscale/engine.go` | gomobile-bound engine (userspace tailscaled + SOCKS5 + DNS relay) |
-| `tailscale/engine_test.go` | Go unit tests (log-id persistence) |
-| `tailscale/go.mod`, `tailscale/go.sum` | pins `tailscale.com v1.102.3` and `firestack@61894b7fdb`; declares gomobile/gobind as module tools |
+| `tailscale/engine_test.go` | Go unit tests (log-id persistence, inbound TCP allowlist) |
+| `tailscale/go.mod`, `tailscale/go.sum` | pins `tailscale.com v1.102.3` and `firestack@d3d530ea3e`; declares gomobile/gobind as module tools |
 | `tailscale/tools/runtime_write_err_android.patch` | vendored firestack runtime-overlay patch applied during the bind |
 | `.github/workflows/tailscale-aar.yml` | builds/publishes `tailscale.aar` releases (`ts-aar-v*` tags) |
 | `.github/actions/build-tailscale-aar/` | composite action used by all APK workflows |
@@ -103,7 +120,7 @@ Key decisions:
 | `service/TunFlowManager.kt` | per-flow routing decision into `TS` |
 | `service/GlobalProxyHandler.kt` | re-adds `TS` if it disappears from the tunnel |
 | `tunnel/TunDnsManager.kt` | routes MagicDNS-suffix queries to the `TSDNS` transport |
-| `ui/activity/TailscaleSettingsActivity.kt` (main source set) | enable / login (browser or auth key) / Headscale URL / exit node / advertise & accept routes / shields-up / MagicDNS / app assignment |
+| `ui/activity/TailscaleSettingsActivity.kt` (main source set) | enable / login (browser or auth key) / Headscale URL / exit node / advertise & accept routes / shields-up / inbound TCP ports / MagicDNS / app assignment |
 | `res/layout/activity_tailscale_settings.xml` | settings screen layout (on the `main` res path via `src/full/res`) |
 
 ## Build & consume the AAR
@@ -130,6 +147,8 @@ printf '{"Replace":{"src/runtime/write_err_android.go":"%s"}}' \
   "$PWD/build/src/runtime/write_err_android.go" > build/overlay.json
 
 export CGO_LDFLAGS='-Wl,-z,max-page-size=16384'
+# local toolchain so the runtime overlay patches this Go's GOROOT
+export GOTOOLCHAIN=local
 gomobile bind -trimpath -a \
   -javapkg=com.celzero.firestack \
   -androidapi 23 -target=android -tags='android,ts_omit_taildrop' \
@@ -156,8 +175,10 @@ release assets come from the `ts-aar-v*` tags via `-PtailscaleRepo=release`
 
 ## Testing
 
-- Kotlin: `app/src/test/.../TailscaleManagerStateTest.kt` (state mapping).
-- Go: `cd tailscale && go test ./...`.
+- Kotlin: `app/src/test/.../TailscaleManagerStateTest.kt` (state mapping) and
+  `InboundTcpPortsTest.kt` (inbound TCP allowlist parser, presets, grouping
+  and summary formatting).
+- Go: `cd tailscale && go test ./...` (includes inbound allowlist + reserved-port tests).
 - Manual: enable Tailscale → log in (SaaS or Headscale URL) → assign an app →
   verify the app reaches a tailnet IP / exit-node-routed destination; toggle
   off and confirm the proxy disappears from the tunnel. With MagicDNS on,

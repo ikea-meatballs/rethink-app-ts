@@ -71,5 +71,5 @@ jobs:
           TAG="ts-aar-${VERSION}"
           gh release create "$TAG" app/libs/tailscale.aar \
             --title "Combined firestack+Tailscale AAR ${VERSION}" \
-            --notes "Combined gomobile AAR (firestack ${{ '61894b7fdb' }} + Tailscale engine) built from ${GITHUB_SHA}. Consume with -PtailscaleRepo=release." \
+            --notes "Combined gomobile AAR (firestack ${{ 'd3d530ea3e' }} + Tailscale engine) built from ${GITHUB_SHA}. Consume with -PtailscaleRepo=release." \
             --latest=false

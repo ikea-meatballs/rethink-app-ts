@@ -228,6 +228,33 @@
                     android:layout_marginTop="10dp"
                     android:text="@string/ts_shields_up" />
 
+                <LinearLayout
+                    android:id="@+id/ts_inbound_tcp_ports_rl"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:background="?attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true"
+                    android:orientation="vertical"
+                    android:paddingStart="4dp"
+                    android:paddingEnd="4dp">
+
+                    <androidx.appcompat.widget.AppCompatTextView
+                        style="@style/TextAppearance.AppCompat.Subhead"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/ts_inbound_tcp_ports" />
+
+                    <androidx.appcompat.widget.AppCompatTextView
+                        android:id="@+id/ts_inbound_tcp_ports_subtitle"
+                        style="@style/TextAppearance.AppCompat.Small"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="@string/ts_inbound_tcp_ports_none" />
+                </LinearLayout>
+
                 <com.google.android.material.materialswitch.MaterialSwitch
                         style="@style/CustomWidget.Material3.CompoundButton.MaterialSwitch"
                     android:id="@+id/ts_accept_routes_switch"

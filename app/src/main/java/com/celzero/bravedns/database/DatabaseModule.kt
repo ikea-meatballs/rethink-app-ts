@@ -26,6 +26,7 @@ object DatabaseModule {
         single { AppDatabase.buildDatabase(androidContext()) }
         single { LogDatabase.buildDatabase(androidContext()) }
         single { ConsoleLogDatabase.buildDatabase(androidContext()) }
+        single { RpnLogDatabase.buildDatabase(androidContext()) }
     }
     private val daoModule = module {
         single { get<AppDatabase>().appInfoDAO() }
@@ -51,6 +52,7 @@ object DatabaseModule {
         single { get<AppDatabase>().subscriptionStatusDao() }
         single { get<AppDatabase>().subscriptionStateHistoryDao()}
         single { get<AppDatabase>().countryConfigDAO() }
+        single { get<AppDatabase>().smartDnsEndpointDao() }
 
         single { get<LogDatabase>().connectionTrackerDAO() }
         single { get<LogDatabase>().dnsLogDAO() }
@@ -60,6 +62,7 @@ object DatabaseModule {
         single { get<LogDatabase>().eventDao() }
 
         single { get<ConsoleLogDatabase>().consoleLogDAO() }
+        single { get<RpnLogDatabase>().rpnLogDAO() }
 
         single { get<AppDatabase>().sponsorDao() }
 
@@ -89,6 +92,7 @@ object DatabaseModule {
         single { get<AppDatabase>().subscriptionStatusRepository() }
         single { get<AppDatabase>().subscriptionStateHistoryDao() }
         single { get<AppDatabase>().countryConfigRepository() }
+        single { get<AppDatabase>().smartDnsEndpointRepository() }
 
         single { get<LogDatabase>().rethinkConnectionLogRepository() }
         single { get<LogDatabase>().connectionTrackerRepository() }
@@ -96,6 +100,7 @@ object DatabaseModule {
         single { get<LogDatabase>().ipInfoRepository() }
 
         single { get<ConsoleLogDatabase>().consoleLogRepository() }
+        single { get<RpnLogDatabase>().rpnLogRepository() }
 
         single { SponsorRepository(get()) }
         single { ServerOrderHistoryRepository(get()) }

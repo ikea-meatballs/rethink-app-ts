@@ -15,19 +15,25 @@
  */
 package com.celzero.bravedns.ui.activity
 
+import android.app.AlertDialog
 import android.content.Context
 import android.content.res.Configuration
 import android.content.res.Configuration.UI_MODE_NIGHT_YES
 import android.os.Bundle
+import android.view.LayoutInflater
 import android.view.View
 import android.widget.CompoundButton
+import android.widget.LinearLayout
 import android.widget.Toast
+import androidx.appcompat.widget.AppCompatCheckBox
+import androidx.appcompat.widget.AppCompatTextView
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.widget.addTextChangedListener
 import androidx.lifecycle.lifecycleScope
 import by.kirich1409.viewbindingdelegate.viewBinding
 import com.celzero.bravedns.R
-import com.celzero.bravedns.adapter.WgIncludeAppsAdapter
 import com.celzero.bravedns.databinding.ActivityTailscaleSettingsBinding
+import com.celzero.bravedns.service.InboundTcpPorts
 import com.celzero.bravedns.service.PersistentState
 import com.celzero.bravedns.service.TailscaleManager
 import com.celzero.bravedns.service.TailscaleManager.TsState
@@ -39,11 +45,13 @@ import com.celzero.bravedns.util.UIUtils.openUrl
 import com.celzero.bravedns.util.Utilities.isAtleastQ
 import com.celzero.bravedns.util.Utilities.showToastUiCentered
 import com.celzero.bravedns.util.handleFrostEffectIfNeeded
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.textfield.TextInputLayout
 import kotlinx.coroutines.launch
 import org.koin.android.ext.android.inject
 import org.koin.androidx.viewmodel.ext.android.viewModel
-import com.celzero.bravedns.ui.dialog.WgIncludeAppsDialog
-import com.celzero.bravedns.viewmodel.ProxyAppsMappingViewModel
+import com.celzero.bravedns.ui.activity.WgIncludeAppsActivity
 
 /**
  * Settings screen for the embedded Tailscale engine: enable/disable, login
@@ -54,7 +62,6 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
     private val b by viewBinding(ActivityTailscaleSettingsBinding::bind)
     private val persistentState by inject<PersistentState>()
     private val tsManager by inject<TailscaleManager>()
-    private val mappingViewModel: ProxyAppsMappingViewModel by viewModel()
 
     private fun Context.isDarkThemeOn(): Boolean {
         return resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
@@ -87,8 +94,33 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
         b.tsAcceptRoutesSwitch.isChecked = persistentState.tailscaleAcceptRoutes
         b.tsMagicDnsSwitch.isChecked = persistentState.tailscaleMagicDns
         b.tsAdvertiseRoutes.setText(persistentState.tailscaleAdvertiseRoutes)
+        updateInboundTcpPortsSubtitle()
         updateStatusUi(tsManager.currentState())
         updateMagicDnsSuffix(persistentState.tailscaleMagicDns)
+    }
+
+    /** Currently selected presets (canonical order), read from prefs. */
+    private fun currentPresetIds(): List<String> =
+        InboundTcpPorts.parsePresetIds(persistentState.tailscaleInboundTcpPresets)
+
+    /** Current Custom ports spec, read from prefs. */
+    private fun currentCustomSpec(): String = persistentState.tailscaleInboundTcpPorts
+
+    /** Shows what the inbound TCP allowlist currently does (see InboundTcpPorts). */
+    private fun updateInboundTcpPortsSubtitle() {
+        val presets = currentPresetIds()
+        val custom = currentCustomSpec()
+        if (InboundTcpPorts.activeGroups(presets, custom).isEmpty()) {
+            b.tsInboundTcpPortsSubtitle.text = getString(R.string.ts_inbound_tcp_ports_none)
+            return
+        }
+        val summary = InboundTcpPorts.formatCardSubtitle(presets, custom, false)
+        b.tsInboundTcpPortsSubtitle.text =
+            // shields-up drops inbound before netstack, so the allowlist
+            // has no effect until it is off
+            if (persistentState.tailscaleShieldsUp)
+                getString(R.string.ts_inbound_tcp_ports_shields_up, summary)
+            else summary
     }
 
     private fun updateMagicDnsSuffix(enabled: Boolean) {
@@ -257,6 +289,7 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
 
         b.tsShieldsUpSwitch.setOnCheckedChangeListener { _: CompoundButton, checked: Boolean ->
             persistentState.tailscaleShieldsUp = checked
+            updateInboundTcpPortsSubtitle()
             lifecycleScope.launch { tsManager.applyPendingPrefs() }
         }
 
@@ -294,6 +327,8 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
 
         b.tsAppsBtn.setOnClickListener { openAppsDialog() }
 
+        b.tsInboundTcpPortsRl.setOnClickListener { openInboundTcpPortsDialog() }
+
         b.tsControlUrl.setOnFocusChangeListener { _, hasFocus ->
             if (hasFocus) return@setOnFocusChangeListener
             val url = b.tsControlUrl.text?.toString()?.trim().orEmpty()
@@ -311,6 +346,109 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
         }
     }
 
+    /**
+     * Editor for the inbound TCP allowlist: starter preset groups plus Custom
+     * ports/ranges on this node's Tailscale IP that netstack forwards to
+     * 127.0.0.1. Nothing selected and an empty Custom = block all inbound TCP
+     * (the default).
+     */
+    private fun openInboundTcpPortsDialog() {
+        val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_inbound_tcp_ports, null)
+        val inputLayout =
+            dialogView.findViewById<TextInputLayout>(R.id.dib_inbound_tcp_ports_layout)
+        val input = dialogView.findViewById<TextInputEditText>(R.id.dib_inbound_tcp_ports)
+        val groupsView =
+            dialogView.findViewById<AppCompatTextView>(R.id.dib_inbound_tcp_ports_groups)
+        val presetsContainer =
+            dialogView.findViewById<LinearLayout>(R.id.dib_inbound_tcp_presets_container)
+
+        val selected = currentPresetIds().toMutableSet()
+        input.setText(currentCustomSpec())
+
+        val refreshGroups = {
+            groupsView.text =
+                InboundTcpPorts.formatDialogGroups(selected, input.text?.toString().orEmpty())
+        }
+
+        InboundTcpPorts.PRESETS.forEach { preset ->
+            val row =
+                LayoutInflater.from(this)
+                    .inflate(R.layout.item_inbound_tcp_preset, presetsContainer, false)
+            val check = row.findViewById<AppCompatCheckBox>(R.id.item_inbound_tcp_preset_checkbox)
+            row.findViewById<AppCompatTextView>(R.id.item_inbound_tcp_preset_label).text =
+                preset.label
+            val spec =
+                if (preset.note.isEmpty()) preset.spec
+                else getString(R.string.two_argument_dot, preset.spec, preset.note)
+            row.findViewById<AppCompatTextView>(R.id.item_inbound_tcp_preset_spec).text = spec
+            check.isChecked = selected.contains(preset.id)
+            // the whole row toggles; the checkbox itself only reflects state
+            row.setOnClickListener { check.isChecked = !check.isChecked }
+            check.setOnCheckedChangeListener { _, checked ->
+                if (checked) selected.add(preset.id) else selected.remove(preset.id)
+                refreshGroups()
+            }
+            presetsContainer.addView(row)
+        }
+
+        input.addTextChangedListener { text ->
+            val result = InboundTcpPorts.validate(text?.toString().orEmpty())
+            inputLayout.error = if (result.valid) null else result.error
+            refreshGroups()
+        }
+        refreshGroups()
+
+        val dialog =
+            MaterialAlertDialogBuilder(this, R.style.App_Dialog_NoDim)
+                .setTitle(getString(R.string.ts_inbound_tcp_ports))
+                .setView(dialogView)
+                .setPositiveButton(getString(R.string.lbl_save), null)
+                .setNeutralButton(getString(R.string.ts_clear)) { d, _ ->
+                    lifecycleScope.launch {
+                        tsManager.clearInboundTcpConfig()
+                        updateInboundTcpPortsSubtitle()
+                    }
+                    d.dismiss()
+                }
+                .setNegativeButton(getString(R.string.lbl_cancel)) { d, _ -> d.dismiss() }
+                .create()
+        // override Save so invalid input keeps the dialog open and surfaces an
+        // inline error instead of dismissing
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val result = InboundTcpPorts.validate(input.text?.toString().orEmpty())
+                if (!result.valid) {
+                    inputLayout.error = result.error
+                    return@setOnClickListener
+                }
+                inputLayout.error = null
+                lifecycleScope.launch {
+                    val (ok, err) = tsManager.setInboundTcpConfig(selected, result.normalized)
+                    if (!ok) {
+                        showToastUiCentered(
+                            applicationContext,
+                            getString(
+                                R.string.two_argument_colon,
+                                getString(R.string.ts_inbound_tcp_ports_failed),
+                                err
+                            ),
+                            Toast.LENGTH_LONG
+                        )
+                        return@launch
+                    }
+                    updateInboundTcpPortsSubtitle()
+                    val msg =
+                        if (selected.isEmpty() && result.normalized.isEmpty())
+                            R.string.ts_inbound_tcp_ports_cleared
+                        else R.string.ts_inbound_tcp_ports_saved
+                    showToastUiCentered(applicationContext, getString(msg), Toast.LENGTH_SHORT)
+                    dialog.dismiss()
+                }
+            }
+        }
+        dialog.show()
+    }
+
     /** Per-app assignment of the tailnet proxy, mirroring WireGuard / Orbot. */
     private fun openAppsDialog() {
         if (!VpnController.hasTunnel()) {
@@ -321,24 +459,14 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
             )
             return
         }
-        val proxyId = TailscaleManager.ID_TS_BASE
-        val appsAdapter = WgIncludeAppsAdapter(this, proxyId, TailscaleManager.TS_PROXY_NAME)
-        mappingViewModel.apps.removeObservers(this)
-        mappingViewModel.apps.observe(this) { appsAdapter.submitData(lifecycle, it) }
-        var themeId = Themes.getCurrentTheme(isDarkThemeOn(), persistentState.theme)
-        if (Themes.isFrostTheme(themeId)) {
-            themeId = R.style.App_Dialog_NoDim
-        }
-        val dialog =
-            WgIncludeAppsDialog(
+        // upstream replaced the per-app bottom dialog with a full-screen
+        // activity (app/src/main/.../ui/activity/WgIncludeAppsActivity.kt)
+        startActivity(
+            WgIncludeAppsActivity.newIntent(
                 this,
-                appsAdapter,
-                mappingViewModel,
-                themeId,
-                proxyId,
+                TailscaleManager.ID_TS_BASE,
                 TailscaleManager.TS_PROXY_NAME
             )
-        dialog.setCanceledOnTouchOutside(false)
-        dialog.show()
+        )
     }
 }

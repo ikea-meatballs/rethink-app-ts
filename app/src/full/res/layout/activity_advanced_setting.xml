@@ -150,7 +150,7 @@
 
                 </RelativeLayout>
 
-                <RelativeLayout
+                <androidx.constraintlayout.widget.ConstraintLayout
                     android:id="@+id/settings_pt_mode_rl"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -162,22 +162,25 @@
                         android:id="@+id/settings_pt_mode_icon"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:layout_centerVertical="true"
                         android:layout_marginStart="5dp"
                         android:layout_marginTop="5dp"
                         android:layout_marginEnd="5dp"
                         android:layout_marginBottom="5dp"
                         android:padding="10dp"
                         android:alpha="0.5"
-                        android:src="@drawable/ic_ip_network" />
+                        android:src="@drawable/ic_ip_network"
+                        app:layout_constraintBottom_toBottomOf="parent"
+                        app:layout_constraintStart_toStartOf="parent"
+                        app:layout_constraintTop_toTopOf="parent" />
 
                     <LinearLayout
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
-                        android:layout_centerVertical="true"
-                        android:layout_toStartOf="@id/settings_pt_mode_value_txt"
-                        android:layout_toEndOf="@id/settings_pt_mode_icon"
-                        android:orientation="vertical">
+                        android:orientation="vertical"
+                        app:layout_constraintBottom_toBottomOf="parent"
+                        app:layout_constraintEnd_toStartOf="@id/settings_pt_mode_value_txt"
+                        app:layout_constraintStart_toEndOf="@id/settings_pt_mode_icon"
+                        app:layout_constraintTop_toTopOf="parent">
 
                         <androidx.appcompat.widget.AppCompatTextView
                             android:id="@+id/settings_pt_mode_txt"
@@ -201,12 +204,13 @@
                         style="@style/TextAppearance.AppCompat.Body2"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:layout_alignParentEnd="true"
-                        android:layout_centerVertical="true"
                         android:padding="10dp"
-                        android:textColor="?attr/colorPrimary" />
+                        android:textColor="?attr/colorPrimary"
+                        app:layout_constraintBottom_toBottomOf="parent"
+                        app:layout_constraintEnd_toEndOf="parent"
+                        app:layout_constraintTop_toTopOf="parent" />
 
-                </RelativeLayout>
+                </androidx.constraintlayout.widget.ConstraintLayout>
 
                 <LinearLayout
                     android:id="@+id/settings_go_max_memory_ll"
@@ -319,6 +323,50 @@
                             android:layout_height="wrap_content"
                             android:paddingTop="5dp"
                             android:text="@string/tour_debug_reset_desc"
+                            android:textSize="@dimen/default_font_text_view" />
+                    </LinearLayout>
+
+                </RelativeLayout>
+
+                <RelativeLayout
+                    android:id="@+id/settings_reset_rpn_tour_rl"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:paddingTop="15dp"
+                    android:paddingBottom="15dp">
+
+                    <androidx.appcompat.widget.AppCompatImageView
+                        android:id="@+id/settings_reset_rpn_tour_icon"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_centerVertical="true"
+                        android:layout_marginStart="5dp"
+                        android:layout_marginEnd="5dp"
+                        android:padding="10dp"
+                        android:src="@drawable/ic_app_info_accent" />
+
+                    <LinearLayout
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_centerVertical="true"
+                        android:layout_toEndOf="@id/settings_reset_rpn_tour_icon"
+                        android:orientation="vertical">
+
+                        <androidx.appcompat.widget.AppCompatTextView
+                            android:id="@+id/settings_reset_rpn_tour_txt"
+                            style="@style/TextAppearance.AppCompat.Subhead"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Reset RPN Onboarding Tour"
+                            android:textSize="@dimen/large_font_text_view" />
+
+                        <androidx.appcompat.widget.AppCompatTextView
+                            android:id="@+id/settings_reset_rpn_tour_desc"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:paddingTop="5dp"
+                            android:text="Show the RPN onboarding tour again on next dashboard visit."
                             android:textSize="@dimen/default_font_text_view" />
                     </LinearLayout>
 
