@@ -346,32 +346,51 @@ class TailscaleManager private constructor(private val context: Context) : KoinC
     fun getExitNode(): String = persistentState.tailscaleExitNode
 
     /**
-     * Validates, persists and applies the inbound TCP allowlist spec
-     * (comma-separated ports/ranges forwarded to 127.0.0.1; empty blocks all
-     * inbound TCP). Applied live when the engine is up (no restart needed),
-     * otherwise it is picked up by [applyPendingPrefs] at engine start.
+     * Validates, persists and applies the inbound TCP allowlist: the presets
+     * named in [presetIds] plus the user's own ports/ranges in [customSpec],
+     * all of which are forwarded to 127.0.0.1 when reached on this node's
+     * Tailscale IP; nothing selected + an empty Custom blocks all inbound TCP.
+     * Applied live when the engine is up (no restart needed), otherwise it is
+     * picked up by [applyPendingPrefs] at engine start.
      *
      * Returns (true, "") on success, else (false, user-facing error).
      */
-    suspend fun setInboundTcpPorts(spec: String): Pair<Boolean, String> {
-        val result = InboundTcpPorts.validate(spec)
-        if (!result.valid) {
-            return Pair(false, result.error)
+    suspend fun setInboundTcpConfig(
+        presetIds: Collection<String>,
+        customSpec: String
+    ): Pair<Boolean, String> {
+        val combined = InboundTcpPorts.combineSpec(presetIds, customSpec)
+        if (!combined.valid) {
+            return Pair(false, combined.error)
         }
-        persistentState.tailscaleInboundTcpPorts = result.normalized
+        // only the Custom field is persisted in tailscaleInboundTcpPorts; the
+        // presets keep their own pref and the engine gets the combined spec
+        val custom = InboundTcpPorts.validate(customSpec)
+        persistentState.tailscaleInboundTcpPresets =
+            InboundTcpPorts.serializePresetIds(presetIds)
+        persistentState.tailscaleInboundTcpPorts = custom.normalized
         val eng = engine
         if (eng == null || !isEngineUp) {
             // applied later, on engine start, by applyPendingPrefs()
             return Pair(true, "")
         }
         return try {
-            eng.setInboundTCPPorts(result.normalized)
-            Logger.i(TAG, "ts set inbound tcp ports: '${result.normalized}'")
+            eng.setInboundTCPPorts(combined.normalized)
+            Logger.i(TAG, "ts set inbound tcp ports: '${combined.normalized}'")
             Pair(true, "")
         } catch (e: Exception) {
             Logger.e(TAG, "ts set-inbound-tcp-ports failure: ${e.message}", e)
             Pair(false, e.message ?: "failure")
         }
+    }
+
+    /**
+     * Clears every preset and Custom port, leaving inbound TCP default-deny.
+     * Kept separate from [setInboundTcpConfig] so clearing can never forget to
+     * wipe the presets too.
+     */
+    suspend fun clearInboundTcpConfig(): Pair<Boolean, String> {
+        return setInboundTcpConfig(emptySet(), "")
     }
 
     fun getInboundTcpPorts(): String = persistentState.tailscaleInboundTcpPorts
@@ -504,8 +523,11 @@ class TailscaleManager private constructor(private val context: Context) : KoinC
             eng.setCorpDNS(persistentState.tailscaleMagicDns)
             // always applied, including empty, so a cleared pref really does
             // clear the engine's allowlist (default deny)
-            val ports = persistentState.tailscaleInboundTcpPorts
-            val res = InboundTcpPorts.validate(ports)
+            val res =
+                InboundTcpPorts.combineSpec(
+                    persistentState.tailscaleInboundTcpPresets.split(","),
+                    persistentState.tailscaleInboundTcpPorts
+                )
             eng.setInboundTCPPorts(if (res.valid) res.normalized else "")
         } catch (e: Exception) {
             Logger.w(TAG, "ts apply pending prefs err: ${e.message}")

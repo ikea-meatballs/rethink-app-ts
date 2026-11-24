@@ -72,8 +72,12 @@ Key decisions:
    would otherwise forward every inbound tailnet port to `127.0.0.1`. A
    TCP handler default-denies every destination port except a runtime
    allowlist (`Engine.SetInboundTCPPorts`, also in Tailscale settings as
-   **Inbound TCP ports**). The default is empty (reject all). Typical
-   Flux use is `12070-12108`. Ports 1053 (DNS relay) and 1055 (SOCKS5)
+   **Inbound TCP ports**). In the settings UI users pick one or more starter
+   preset groups (Flux `12070-12108`, ADB over TCP `5555`, KDE Connect
+   `1714-1764`, Termux SSH `8022`, Syncthing `22000`) and/or type their own
+   ports and ranges under Custom; the engine still receives a single combined
+   allowlist built from every selected preset plus Custom. Nothing is
+   selected by default (deny all). Ports 1053 (DNS relay) and 1055 (SOCKS5)
    can never be allowlisted. UDP is never forwarded. Tailscale's Shields
    Up, when on, drops inbound connections *before* netstack, so the
    allowlist has no effect until Shields Up is off. Pair the allowlist
@@ -172,7 +176,8 @@ release assets come from the `ts-aar-v*` tags via `-PtailscaleRepo=release`
 ## Testing
 
 - Kotlin: `app/src/test/.../TailscaleManagerStateTest.kt` (state mapping) and
-  `InboundTcpPortsTest.kt` (inbound TCP allowlist parser).
+  `InboundTcpPortsTest.kt` (inbound TCP allowlist parser, presets, grouping
+  and summary formatting).
 - Go: `cd tailscale && go test ./...` (includes inbound allowlist + reserved-port tests).
 - Manual: enable Tailscale → log in (SaaS or Headscale URL) → assign an app →
   verify the app reaches a tailnet IP / exit-node-routed destination; toggle

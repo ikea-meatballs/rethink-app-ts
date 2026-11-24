@@ -118,4 +118,139 @@ class InboundTcpPortsTest {
             )
         }
     }
+
+    @Test
+    fun `presets are the five starter groups with flux first`() {
+        assertEquals(5, InboundTcpPorts.PRESETS.size)
+        assertEquals(
+            listOf("flux", "adb", "kde_connect", "termux_ssh", "syncthing"),
+            InboundTcpPorts.PRESETS.map { it.id }
+        )
+        assertEquals("12070-12108", InboundTcpPorts.PRESETS[0].spec)
+        assertEquals("5555", InboundTcpPorts.PRESETS[1].spec)
+        assertEquals("1714-1764", InboundTcpPorts.PRESETS[2].spec)
+        assertEquals("8022", InboundTcpPorts.PRESETS[3].spec)
+        assertEquals("22000", InboundTcpPorts.PRESETS[4].spec)
+    }
+
+    @Test
+    fun `parsePresetIds drops blanks duplicates and unknown ids`() {
+        assertEquals(emptyList<String>(), InboundTcpPorts.parsePresetIds(""))
+        assertEquals(emptyList<String>(), InboundTcpPorts.parsePresetIds("   "))
+        assertEquals(listOf("flux", "adb"), InboundTcpPorts.parsePresetIds("flux,adb"))
+        assertEquals(
+            listOf("flux", "adb"),
+            InboundTcpPorts.parsePresetIds(" adb, flux, adb, unknown ")
+        )
+        assertEquals(emptyList<String>(), InboundTcpPorts.parsePresetIds("unknown,other"))
+    }
+
+    @Test
+    fun `serializePresetIds is canonical and deduped`() {
+        assertEquals("", InboundTcpPorts.serializePresetIds(emptyList()))
+        assertEquals("flux,adb", InboundTcpPorts.serializePresetIds(listOf("adb", "flux")))
+        assertEquals("flux,adb", InboundTcpPorts.serializePresetIds(listOf("adb", "flux", "adb")))
+        assertEquals("", InboundTcpPorts.serializePresetIds(listOf("unknown")))
+    }
+
+    @Test
+    fun `combineSpec covers presets custom and both`() {
+        assertEquals("12070-12108", InboundTcpPorts.combineSpec(listOf("flux"), "").normalized)
+        assertEquals(
+            "12070-12108, 5555",
+            InboundTcpPorts.combineSpec(listOf("adb", "flux"), "").normalized
+        )
+        assertEquals("8080", InboundTcpPorts.combineSpec(emptyList(), "8080").normalized)
+        assertEquals("12070-12108, 8080", InboundTcpPorts.combineSpec(listOf("flux"), "8080").normalized)
+    }
+
+    @Test
+    fun `combineSpec dedupes preset specs retyped in custom`() {
+        assertEquals(
+            "12070-12108, 8080",
+            InboundTcpPorts.combineSpec(listOf("flux"), "12070-12108, 8080").normalized
+        )
+        assertEquals(
+            "12070-12108, 5555",
+            InboundTcpPorts.combineSpec(listOf("flux", "adb"), "5555").normalized
+        )
+    }
+
+    @Test
+    fun `combineSpec keeps reserved ports rejected even with presets`() {
+        listOf("1053", "1055", "1050-1060").forEach { custom ->
+            val r = InboundTcpPorts.combineSpec(listOf("flux"), custom)
+            assertFalse("custom '$custom' should be invalid", r.valid)
+            assertEquals("", r.normalized)
+            assertTrue("custom '$custom' should carry an error", r.error.isNotEmpty())
+        }
+    }
+
+    @Test
+    fun `combineSpec of nothing is an empty ok`() {
+        val r = InboundTcpPorts.combineSpec(emptyList(), "")
+        assertTrue(r.valid)
+        assertEquals("", r.normalized)
+    }
+
+    @Test
+    fun `activeGroups labels each preset and custom in order`() {
+        val groups =
+            InboundTcpPorts.activeGroups(listOf("adb", "flux"), "8080")
+        assertEquals(
+            listOf(
+                InboundTcpPorts.Group("Flux", "12070-12108"),
+                InboundTcpPorts.Group("ADB over TCP", "5555"),
+                InboundTcpPorts.Group("Custom", "8080")
+            ),
+            groups
+        )
+        assertTrue(InboundTcpPorts.activeGroups(emptyList(), "").isEmpty())
+    }
+
+    @Test
+    fun `activeGroups omits custom when it is invalid`() {
+        val groups = InboundTcpPorts.activeGroups(listOf("flux"), "1053")
+        assertEquals(listOf(InboundTcpPorts.Group("Flux", "12070-12108")), groups)
+    }
+
+    @Test
+    fun `formatCardSubtitle summarizes groups and shields up`() {
+        assertEquals(
+            "None (blocked)",
+            InboundTcpPorts.formatCardSubtitle(emptyList(), "", false)
+        )
+        assertEquals(
+            "Flux (12070-12108)",
+            InboundTcpPorts.formatCardSubtitle(listOf("flux"), "", false)
+        )
+        assertEquals(
+            "Flux (12070-12108) · ADB over TCP (5555)",
+            InboundTcpPorts.formatCardSubtitle(listOf("flux", "adb"), "", false)
+        )
+        assertEquals(
+            "Flux (12070-12108) · Custom (8080)",
+            InboundTcpPorts.formatCardSubtitle(listOf("flux"), "8080", false)
+        )
+        assertEquals(
+            "Flux (12070-12108) (blocked while Shields Up is on)",
+            InboundTcpPorts.formatCardSubtitle(listOf("flux"), "", true)
+        )
+    }
+
+    @Test
+    fun `formatDialogGroups previews one group per line`() {
+        assertEquals(
+            "None (all inbound TCP blocked)",
+            InboundTcpPorts.formatDialogGroups(emptyList(), "")
+        )
+        assertEquals(
+            "Flux: 12070-12108\nADB over TCP: 5555",
+            InboundTcpPorts.formatDialogGroups(listOf("flux", "adb"), "")
+        )
+        assertEquals(
+            "Flux: 12070-12108\nCustom: 8080",
+            InboundTcpPorts.formatDialogGroups(listOf("flux"), "8080")
+        )
+    }
 }

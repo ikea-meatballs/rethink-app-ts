@@ -346,7 +346,7 @@ android {
             // value is set in AndroidManifest.xml so setting it here
             // for build type alpha, versionCode is set in env overriding gradle.properties
             versionCode = getVersionCode()
-            versionName = "v0.2.2-ts"
+            versionName = "v0.2.3-ts"
             buildConfigField("int", "BASE_VERSION_CODE", appVersionCode.toString())
             vectorDrawables.useSupportLibrary = true
         }
@@ -354,7 +354,7 @@ android {
             dimension = "releaseType"
             applicationIdSuffix = ".tv"
             versionCode = getVersionCode()
-            versionName = "v0.2.2-ts"
+            versionName = "v0.2.3-ts"
             buildConfigField("int", "BASE_VERSION_CODE", appVersionCode.toString())
             vectorDrawables.useSupportLibrary = true
         }

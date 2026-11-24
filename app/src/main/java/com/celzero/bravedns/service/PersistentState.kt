@@ -145,6 +145,7 @@ class PersistentState(context: Context) : SimpleKrate(context), KoinComponent {
         const val TAILSCALE_SHIELDS_UP = "tailscale_shields_up"
         const val TAILSCALE_MAGIC_DNS = "tailscale_magic_dns"
         const val TAILSCALE_INBOUND_TCP_PORTS = "tailscale_inbound_tcp_ports"
+        const val TAILSCALE_INBOUND_TCP_PRESETS = "tailscale_inbound_tcp_presets"
 
         // Default custom LAN IPs for the VPN tunnel (used with the withDefault{} values
         // above and by restoreTunnelSettingsDefaults())
@@ -888,6 +889,9 @@ class PersistentState(context: Context) : SimpleKrate(context), KoinComponent {
     // comma-separated TCP ports/ranges (e.g. "12070-12108,8080") forwarded
     // from this node's Tailscale IP to 127.0.0.1; empty = block all inbound TCP
     var tailscaleInboundTcpPorts by stringPref(TAILSCALE_INBOUND_TCP_PORTS).withDefault<String>("")
+
+    // comma-separated preset ids (e.g. "flux,adb"); empty = none selected
+    var tailscaleInboundTcpPresets by stringPref(TAILSCALE_INBOUND_TCP_PRESETS).withDefault<String>("")
 
     // MagicDNS (CorpDNS): resolve tailnet hostnames via the coordination server's DNS
     var tailscaleMagicDns by booleanPref(TAILSCALE_MAGIC_DNS).withDefault<Boolean>(true)

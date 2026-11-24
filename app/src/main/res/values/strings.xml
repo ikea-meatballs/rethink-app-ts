@@ -212,9 +212,15 @@
     <string name="ts_advertise_routes_cleared">Advertise routes cleared</string>
     <string name="ts_inbound_tcp_ports">Inbound TCP ports</string>
     <string name="ts_inbound_tcp_ports_none">None (blocked)</string>
+    <string name="ts_inbound_tcp_ports_groups_none">None (all inbound TCP blocked)</string>
     <string name="ts_inbound_tcp_ports_shields_up">%1$s (blocked while Shields Up is on)</string>
-    <string name="ts_inbound_tcp_ports_hint">e.g. 12070-12108, 8080</string>
-    <string name="ts_inbound_tcp_ports_help">Comma-separated TCP ports or ranges (e.g. 12070-12108, 8080) reached on this device\'s Tailscale IP are forwarded to localhost (127.0.0.1). Leave empty to block all inbound TCP. Requires Shields Up off and a Tailscale ACL restricting those ports to trusted nodes. Ports 1053 and 1055 are reserved (DNS relay / SOCKS5).</string>
+    <string name="ts_inbound_tcp_ports_custom_hint">e.g. 8080, 35000-35010</string>
+    <string name="ts_inbound_tcp_ports_presets_header">Presets</string>
+    <string name="ts_inbound_tcp_ports_custom_header">Custom ports</string>
+    <string name="ts_inbound_tcp_ports_custom_note">Dynamic / one-off ports (e.g. Android Wireless Debugging) go here.</string>
+    <string name="ts_inbound_tcp_ports_active_header">Active groups</string>
+    <string name="ts_inbound_tcp_ports_custom">Custom</string>
+    <string name="ts_inbound_tcp_ports_help">Selected preset groups and custom ports reached on this device\'s Tailscale IP are forwarded to localhost (127.0.0.1). Requires Shields Up off and a Tailscale ACL restricting those ports to trusted nodes. Ports 1053 and 1055 are reserved (DNS relay / SOCKS5).</string>
     <string name="ts_inbound_tcp_ports_saved">Inbound TCP ports updated</string>
     <string name="ts_inbound_tcp_ports_cleared">Inbound TCP ports cleared; all inbound TCP blocked</string>
     <string name="ts_inbound_tcp_ports_failed">Inbound TCP ports update failed</string>

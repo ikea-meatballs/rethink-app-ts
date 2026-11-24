@@ -40,6 +40,44 @@ object InboundTcpPorts {
 
     private val RESERVED = mapOf(DNS_PORT to "DNS relay", SOCKS5_PORT to "SOCKS5 proxy")
 
+    /** Label used for the user-supplied ports (everything not from a preset). */
+    private const val CUSTOM_LABEL = "Custom"
+
+    /** Summary shown when no preset is selected and Custom is empty. */
+    private const val NONE_SUMMARY = "None (blocked)"
+
+    /** Preview shown in the editor dialog when nothing is allowlisted. */
+    private const val NONE_PREVIEW = "None (all inbound TCP blocked)"
+
+    /** Suffix appended to the card summary while Shields Up is on. */
+    private const val SHIELDS_UP_SUFFIX = " (blocked while Shields Up is on)"
+
+    /** A named, starter group of ports offered as a checkbox in the UI. */
+    data class Preset(
+        val id: String,
+        val label: String,
+        val spec: String,
+        val note: String = ""
+    )
+
+    /**
+     * Starter presets, in display order. `flux` is offered first but is never
+     * pre-selected: nothing is allowlisted until the user opts in.
+     */
+    val PRESETS: List<Preset> =
+        listOf(
+            Preset("flux", "Flux", "12070-12108"),
+            Preset("adb", "ADB over TCP", "5555", "adb tcpip 5555"),
+            Preset("kde_connect", "KDE Connect", "1714-1764"),
+            Preset("termux_ssh", "Termux SSH", "8022"),
+            Preset("syncthing", "Syncthing", "22000")
+        )
+
+    private val PRESETS_BY_ID: Map<String, Preset> = PRESETS.associateBy { it.id }
+
+    /** A group of ports with the label it came from (a preset name or Custom). */
+    data class Group(val label: String, val spec: String)
+
     /** Outcome of a validation: either [normalized] or a user-facing [error]. */
     data class Result(
         val valid: Boolean,
@@ -128,6 +166,85 @@ object InboundTcpPorts {
                 t.substring(0, idx).trim().toInt() to t.substring(idx + 1).trim().toInt()
             }
         }
+    }
+
+    /**
+     * Parses a stored comma-separated preset-id string into known preset ids
+     * in canonical [PRESETS] order. Unknown ids, blanks and duplicates are
+     * dropped.
+     */
+    fun parsePresetIds(raw: String): List<String> {
+        return canonicalPresetIds(raw.split(","))
+    }
+
+    /** Serializes preset ids to their canonical, deduped, comma-joined form. */
+    fun serializePresetIds(ids: Collection<String>): String {
+        return canonicalPresetIds(ids).joinToString(",")
+    }
+
+    private fun canonicalPresetIds(ids: Collection<String>): List<String> {
+        val wanted = ids.map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+        return PRESETS.map { it.id }.filter { wanted.contains(it) }
+    }
+
+    /**
+     * Combines the selected presets and the Custom spec into the single
+     * comma-separated spec handed to the engine. An invalid Custom spec
+     * invalidates the whole result (nothing is applied); otherwise identical
+     * entries typed in Custom and already covered by a preset are emitted
+     * once. Empty + empty is a valid "allowlist nothing".
+     */
+    fun combineSpec(presetIds: Collection<String>, customSpec: String): Result {
+        val custom = validate(customSpec)
+        if (!custom.valid) return custom
+
+        val combined = mutableListOf<String>()
+        parsePresetIds(presetIds.joinToString(",")).forEach { id ->
+            PRESETS_BY_ID[id]?.spec?.let { combined.add(it) }
+        }
+        if (custom.normalized.isNotEmpty()) {
+            custom.normalized.split(",").forEach { token ->
+                val t = token.trim()
+                if (t.isNotEmpty() && !combined.contains(t)) combined.add(t)
+            }
+        }
+        return Result.ok(combined.joinToString(", "))
+    }
+
+    /**
+     * One group per selected preset (canonical order) plus a trailing Custom
+     * group when the Custom spec is non-empty. An invalid Custom spec omits
+     * only the Custom group; callers surface `validate`'s error separately.
+     */
+    fun activeGroups(presetIds: Collection<String>, customSpec: String): List<Group> {
+        val groups = mutableListOf<Group>()
+        parsePresetIds(presetIds.joinToString(",")).forEach { id ->
+            PRESETS_BY_ID[id]?.let { groups.add(Group(it.label, it.spec)) }
+        }
+        val custom = validate(customSpec)
+        if (custom.valid && custom.normalized.isNotEmpty()) {
+            groups.add(Group(CUSTOM_LABEL, custom.normalized))
+        }
+        return groups
+    }
+
+    /** Card subtitle for the settings row, e.g. "Flux (12070-12108) · ADB over TCP (5555)". */
+    fun formatCardSubtitle(
+        presetIds: Collection<String>,
+        customSpec: String,
+        shieldsUp: Boolean
+    ): String {
+        val groups = activeGroups(presetIds, customSpec)
+        if (groups.isEmpty()) return NONE_SUMMARY
+        val summary = groups.joinToString(" · ") { "${it.label} (${it.spec})" }
+        return if (shieldsUp) summary + SHIELDS_UP_SUFFIX else summary
+    }
+
+    /** Multi-line editor preview, e.g. "Flux: 12070-12108\nADB over TCP: 5555". */
+    fun formatDialogGroups(presetIds: Collection<String>, customSpec: String): String {
+        val groups = activeGroups(presetIds, customSpec)
+        if (groups.isEmpty()) return NONE_PREVIEW
+        return groups.joinToString("\n") { "${it.label}: ${it.spec}" }
     }
 
     private fun parsePort(token: String): Int? {
