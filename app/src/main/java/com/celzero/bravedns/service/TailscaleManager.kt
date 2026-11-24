@@ -345,6 +345,37 @@ class TailscaleManager private constructor(private val context: Context) : KoinC
 
     fun getExitNode(): String = persistentState.tailscaleExitNode
 
+    /**
+     * Validates, persists and applies the inbound TCP allowlist spec
+     * (comma-separated ports/ranges forwarded to 127.0.0.1; empty blocks all
+     * inbound TCP). Applied live when the engine is up (no restart needed),
+     * otherwise it is picked up by [applyPendingPrefs] at engine start.
+     *
+     * Returns (true, "") on success, else (false, user-facing error).
+     */
+    suspend fun setInboundTcpPorts(spec: String): Pair<Boolean, String> {
+        val result = InboundTcpPorts.validate(spec)
+        if (!result.valid) {
+            return Pair(false, result.error)
+        }
+        persistentState.tailscaleInboundTcpPorts = result.normalized
+        val eng = engine
+        if (eng == null || !isEngineUp) {
+            // applied later, on engine start, by applyPendingPrefs()
+            return Pair(true, "")
+        }
+        return try {
+            eng.setInboundTCPPorts(result.normalized)
+            Logger.i(TAG, "ts set inbound tcp ports: '${result.normalized}'")
+            Pair(true, "")
+        } catch (e: Exception) {
+            Logger.e(TAG, "ts set-inbound-tcp-ports failure: ${e.message}", e)
+            Pair(false, e.message ?: "failure")
+        }
+    }
+
+    fun getInboundTcpPorts(): String = persistentState.tailscaleInboundTcpPorts
+
     suspend fun setMagicDns(enabled: Boolean): Pair<Boolean, String> {
         persistentState.tailscaleMagicDns = enabled
         val eng = engine
@@ -471,6 +502,11 @@ class TailscaleManager private constructor(private val context: Context) : KoinC
             eng.setShieldsUp(persistentState.tailscaleShieldsUp)
             eng.setAcceptRoutes(persistentState.tailscaleAcceptRoutes)
             eng.setCorpDNS(persistentState.tailscaleMagicDns)
+            // always applied, including empty, so a cleared pref really does
+            // clear the engine's allowlist (default deny)
+            val ports = persistentState.tailscaleInboundTcpPorts
+            val res = InboundTcpPorts.validate(ports)
+            eng.setInboundTCPPorts(if (res.valid) res.normalized else "")
         } catch (e: Exception) {
             Logger.w(TAG, "ts apply pending prefs err: ${e.message}")
         }

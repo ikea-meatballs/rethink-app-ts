@@ -15,10 +15,12 @@
  */
 package com.celzero.bravedns.ui.activity
 
+import android.app.AlertDialog
 import android.content.Context
 import android.content.res.Configuration
 import android.content.res.Configuration.UI_MODE_NIGHT_YES
 import android.os.Bundle
+import android.view.LayoutInflater
 import android.view.View
 import android.widget.CompoundButton
 import android.widget.Toast
@@ -27,6 +29,7 @@ import androidx.lifecycle.lifecycleScope
 import by.kirich1409.viewbindingdelegate.viewBinding
 import com.celzero.bravedns.R
 import com.celzero.bravedns.databinding.ActivityTailscaleSettingsBinding
+import com.celzero.bravedns.service.InboundTcpPorts
 import com.celzero.bravedns.service.PersistentState
 import com.celzero.bravedns.service.TailscaleManager
 import com.celzero.bravedns.service.TailscaleManager.TsState
@@ -38,6 +41,9 @@ import com.celzero.bravedns.util.UIUtils.openUrl
 import com.celzero.bravedns.util.Utilities.isAtleastQ
 import com.celzero.bravedns.util.Utilities.showToastUiCentered
 import com.celzero.bravedns.util.handleFrostEffectIfNeeded
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.textfield.TextInputLayout
 import kotlinx.coroutines.launch
 import org.koin.android.ext.android.inject
 import org.koin.androidx.viewmodel.ext.android.viewModel
@@ -84,8 +90,23 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
         b.tsAcceptRoutesSwitch.isChecked = persistentState.tailscaleAcceptRoutes
         b.tsMagicDnsSwitch.isChecked = persistentState.tailscaleMagicDns
         b.tsAdvertiseRoutes.setText(persistentState.tailscaleAdvertiseRoutes)
+        updateInboundTcpPortsSubtitle()
         updateStatusUi(tsManager.currentState())
         updateMagicDnsSuffix(persistentState.tailscaleMagicDns)
+    }
+
+    /** Shows what the inbound TCP allowlist currently does (see InboundTcpPorts). */
+    private fun updateInboundTcpPortsSubtitle() {
+        val spec = persistentState.tailscaleInboundTcpPorts.trim()
+        b.tsInboundTcpPortsSubtitle.text =
+            when {
+                spec.isEmpty() -> getString(R.string.ts_inbound_tcp_ports_none)
+                // shields-up drops inbound before netstack, so the allowlist
+                // has no effect until it is off
+                persistentState.tailscaleShieldsUp ->
+                    getString(R.string.ts_inbound_tcp_ports_shields_up, spec)
+                else -> spec
+            }
     }
 
     private fun updateMagicDnsSuffix(enabled: Boolean) {
@@ -254,6 +275,7 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
 
         b.tsShieldsUpSwitch.setOnCheckedChangeListener { _: CompoundButton, checked: Boolean ->
             persistentState.tailscaleShieldsUp = checked
+            updateInboundTcpPortsSubtitle()
             lifecycleScope.launch { tsManager.applyPendingPrefs() }
         }
 
@@ -291,6 +313,8 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
 
         b.tsAppsBtn.setOnClickListener { openAppsDialog() }
 
+        b.tsInboundTcpPortsRl.setOnClickListener { openInboundTcpPortsDialog() }
+
         b.tsControlUrl.setOnFocusChangeListener { _, hasFocus ->
             if (hasFocus) return@setOnFocusChangeListener
             val url = b.tsControlUrl.text?.toString()?.trim().orEmpty()
@@ -306,6 +330,68 @@ class TailscaleSettingsActivity : BaseActivity(R.layout.activity_tailscale_setti
                 }
             }
         }
+    }
+
+    /**
+     * Editor for the inbound TCP allowlist: ports/ranges on this node's
+     * Tailscale IP that netstack forwards to 127.0.0.1. Empty = block all
+     * inbound TCP (the default).
+     */
+    private fun openInboundTcpPortsDialog() {
+        val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_inbound_tcp_ports, null)
+        val inputLayout =
+            dialogView.findViewById<TextInputLayout>(R.id.dib_inbound_tcp_ports_layout)
+        val input = dialogView.findViewById<TextInputEditText>(R.id.dib_inbound_tcp_ports)
+        input.setText(persistentState.tailscaleInboundTcpPorts)
+
+        val dialog =
+            MaterialAlertDialogBuilder(this, R.style.App_Dialog_NoDim)
+                .setTitle(getString(R.string.ts_inbound_tcp_ports))
+                .setView(dialogView)
+                .setPositiveButton(getString(R.string.lbl_save), null)
+                .setNeutralButton(getString(R.string.ts_clear)) { d, _ ->
+                    lifecycleScope.launch {
+                        tsManager.setInboundTcpPorts("")
+                        updateInboundTcpPortsSubtitle()
+                    }
+                    d.dismiss()
+                }
+                .setNegativeButton(getString(R.string.lbl_cancel)) { d, _ -> d.dismiss() }
+                .create()
+        // override Save so invalid input keeps the dialog open and surfaces an
+        // inline error instead of dismissing
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val result = InboundTcpPorts.validate(input.text?.toString().orEmpty())
+                if (!result.valid) {
+                    inputLayout.error = result.error
+                    return@setOnClickListener
+                }
+                inputLayout.error = null
+                lifecycleScope.launch {
+                    val (ok, err) = tsManager.setInboundTcpPorts(result.normalized)
+                    if (!ok) {
+                        showToastUiCentered(
+                            applicationContext,
+                            getString(
+                                R.string.two_argument_colon,
+                                getString(R.string.ts_inbound_tcp_ports_failed),
+                                err
+                            ),
+                            Toast.LENGTH_LONG
+                        )
+                        return@launch
+                    }
+                    updateInboundTcpPortsSubtitle()
+                    val msg =
+                        if (result.normalized.isEmpty()) R.string.ts_inbound_tcp_ports_cleared
+                        else R.string.ts_inbound_tcp_ports_saved
+                    showToastUiCentered(applicationContext, getString(msg), Toast.LENGTH_SHORT)
+                    dialog.dismiss()
+                }
+            }
+        }
+        dialog.show()
     }
 
     /** Per-app assignment of the tailnet proxy, mirroring WireGuard / Orbot. */
